@@ -1,0 +1,30 @@
+{
+  "source": "Grab3D Human Skeleton, rigged GLB",
+  "url": "https://grab3d.com/dl/human-skeleton-rigged/human-skeleton-rigged.glb",
+  "license": "CC0-1.0",
+  "unit_scale": 1.0,
+  "aims": [
+    ["Hips", "Spine02"],
+    ["Spine02", "Spine01"],
+    ["Spine01", "Spine"],
+    ["Spine", "neck"],
+    ["neck", "Head"],
+    ["Head", "head_end"],
+    ["LeftShoulder", "LeftArm"],
+    ["LeftArm", "LeftForeArm"],
+    ["LeftForeArm", "LeftHand"],
+    ["LeftHand", "_LeftFingers"],
+    ["RightShoulder", "RightArm"],
+    ["RightArm", "RightForeArm"],
+    ["RightForeArm", "RightHand"],
+    ["RightHand", "_RightFingers"],
+    ["LeftUpLeg", "LeftLeg"],
+    ["LeftLeg", "LeftFoot"],
+    ["LeftFoot", "LeftToeBase"],
+    ["LeftToeBase", "_LeftToeEnd"],
+    ["RightUpLeg", "RightLeg"],
+    ["RightLeg", "RightFoot"],
+    ["RightFoot", "RightToeBase"],
+    ["RightToeBase", "_RightToeEnd"]
+  ]
+}
