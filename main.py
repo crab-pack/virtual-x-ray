@@ -979,6 +979,7 @@ class Collimator:
         self.box = list(COLLIMATOR_DEFAULT)
         self.editing = False
         self._drag: tuple[str, int, int, list[int]] | None = None  # (종류, 시작 x, 시작 y, 시작 박스)
+        self.display: tuple[float, int, int] = (1.0, 0, 0)  # 마지막으로 그린 (배율, x 여백, y 여백)
         self._load()
 
     # ---- 저장
@@ -1028,14 +1029,20 @@ class Collimator:
         return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
 
     def on_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
-        """cv2.setMouseCallback용. 편집 모드가 아니면 아무것도 바꾸지 않는다."""
+        """cv2.setMouseCallback용. 편집 모드가 아니면 아무것도 바꾸지 않는다.
+
+        마우스 좌표는 창에 표시된 그림 기준이라, 마지막으로 그린 표시 배율로 아바타 화면 좌표로 바꾼다.
+        """
         if not self.editing:
             return
+        scale, ox, oy = self.display
+        x = int(round((x - ox) / scale))
+        y = int(round((y - oy) / scale))
         if event == cv2.EVENT_LBUTTONDOWN:
             dist = [np.hypot(x - cx, y - cy) for cx, cy in self._corners()]
             nearest = int(np.argmin(dist))
             x1, y1, x2, y2 = self.box
-            if dist[nearest] <= COLLIMATOR_HANDLE:
+            if dist[nearest] <= COLLIMATOR_HANDLE / scale:
                 self._drag = ("corner", nearest, 0, list(self.box))
             elif x1 <= x <= x2 and y1 <= y <= y2:
                 self._drag = ("move", x, y, list(self.box))
@@ -1055,17 +1062,24 @@ class Collimator:
             self._drag = None
 
     # ---- 그리기
-    def draw(self, frame: np.ndarray) -> np.ndarray:
+    def draw(self, frame: np.ndarray, display: tuple[float, int, int] = (1.0, 0, 0)) -> np.ndarray:
+        """frame에 콜리메이터를 그린다. display는 아바타 화면이 frame 안에 놓인 (배율, x 여백, y 여백).
+
+        창 크기로 줄인 그림 위에 바로 그려야 선과 손잡이가 깨지지 않는다.
+        """
+        self.display = display
+        scale, ox, oy = display
+        x1, y1, x2, y2 = (int(round(v * scale)) + o for v, o in zip(self.box, (ox, oy, ox, oy)))
         out = cv2.convertScaleAbs(frame, alpha=COLLIMATOR_DIM)
-        x1, y1, x2, y2 = self.box
         out[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        tail = max(1, int(round(COLLIMATOR_TAIL * scale)))
         line = dict(color=COLLIMATOR_LINE, thickness=COLLIMATOR_THICK, lineType=cv2.LINE_AA)
         cv2.rectangle(out, (x1, y1), (x2 - 1, y2 - 1), **line)
-        cv2.line(out, (cx, y1 - COLLIMATOR_TAIL), (cx, y2 + COLLIMATOR_TAIL), **line)
-        cv2.line(out, (x1 - COLLIMATOR_TAIL, cy), (x2 + COLLIMATOR_TAIL, cy), **line)
+        cv2.line(out, (cx, y1 - tail), (cx, y2 + tail), **line)
+        cv2.line(out, (x1 - tail, cy), (x2 + tail, cy), **line)
         if self.editing:
-            for px, py in self._corners():
+            for px, py in ((x1, y1), (x2, y1), (x2, y2), (x1, y2)):
                 cv2.rectangle(out, (px - 7, py - 7), (px + 7, py + 7), COLLIMATOR_EDIT_COLOR, -1, cv2.LINE_AA)
                 cv2.rectangle(out, (px - 7, py - 7), (px + 7, py + 7), (0, 0, 0), 1, cv2.LINE_AA)
         return out
@@ -1126,6 +1140,41 @@ class OverlayCache:
 HUD_CACHE = OverlayCache()
 
 
+def fit_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> ImageFont.ImageFont:
+    """글자가 max_width보다 넓으면 글꼴 크기를 줄인다 (좁은 창에서 아래 안내 문구가 잘리지 않게)."""
+    box = draw.textbbox((0, 0), text, font=font)
+    width = box[2] - box[0]
+    size = getattr(font, "size", None)
+    if width <= max_width or not size:
+        return font
+    return load_font(max(9, int(size * max_width / width)))
+
+
+def fit_to_window(name: str, image: np.ndarray) -> tuple[np.ndarray, tuple[float, int, int]]:
+    """창의 실제 크기에 맞춰 비율을 유지한 채 줄이거나 늘린 그림과 (배율, x 여백, y 여백).
+
+    OpenCV 창은 그림을 창 크기로 바꿀 때 픽셀을 건너뛰며 줄여서, 얇은 글자와 선이 깨진다.
+    여기서 부드럽게 크기를 맞춘 뒤 글자·선을 그 위에 그리면 창에서 1:1로 표시된다.
+    """
+    ih, iw = image.shape[:2]
+    try:
+        _x, _y, ww, wh = cv2.getWindowImageRect(name)
+    except cv2.error:
+        ww, wh = iw, ih
+    if ww < 16 or wh < 16:  # 최소화 등으로 크기를 모를 때
+        return image, (1.0, 0, 0)
+    scale = min(ww / iw, wh / ih)
+    nw, nh = max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))
+    if (nw, nh) == (iw, ih) and (ww, wh) == (iw, ih):
+        return image, (1.0, 0, 0)
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(image, (nw, nh), interpolation=interp)
+    canvas = np.zeros((wh, ww, 3), dtype=np.uint8)
+    ox, oy = (ww - nw) // 2, (wh - nh) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = resized
+    return canvas, (scale, ox, oy)
+
+
 def draw_avatar_hud(
     frame: np.ndarray,
     live: bool,
@@ -1139,11 +1188,12 @@ def draw_avatar_hud(
         draw.text((32, 60), status, font=font_small, fill=(186, 214, 230, 255))
 
         help_text = "방향키 위치    + - 확대    A D 회전    C 조명    L 조명 맞추기    R 초기화"
-        box = draw.textbbox((0, 0), help_text, font=font_small)
+        help_font = fit_text(draw, help_text, font_small, width - 68)
+        box = draw.textbbox((0, 0), help_text, font=help_font)
         text_w = box[2] - box[0]
         bar_x = max(16, (width - text_w) // 2 - 18)
         draw.rounded_rectangle((bar_x, height - 52, bar_x + text_w + 36, height - 16), radius=12, fill=(8, 12, 18, 170))
-        draw.text((bar_x + 18, height - 44), help_text, font=font_small, fill=(226, 236, 244, 255))
+        draw.text((bar_x + 18, height - 44), help_text, font=help_font, fill=(226, 236, 244, 255))
 
         if not live:
             message = "카메라에 몸이 보이면 따라 움직입니다"
@@ -1307,7 +1357,8 @@ def draw_hud(
         draw.text((32, 92), tracking, font=font_small, fill=(186, 214, 230, 255))
 
         help_text = "Q 종료    M 반전    V 추가기능    H 손가락    B 디버그    S 저장"
-        box = draw.textbbox((0, 0), help_text, font=font_small)
+        help_font = fit_text(draw, help_text, font_small, width - 68)
+        box = draw.textbbox((0, 0), help_text, font=help_font)
         text_w = box[2] - box[0]
         bar_x = max(16, (width - text_w) // 2 - 18)
         draw.rounded_rectangle(
@@ -1315,7 +1366,7 @@ def draw_hud(
             radius=12,
             fill=(6, 14, 24, 168),
         )
-        draw.text((bar_x + 18, height - 44), help_text, font=font_small, fill=(226, 238, 246, 255))
+        draw.text((bar_x + 18, height - 44), help_text, font=help_font, fill=(226, 238, 246, 255))
 
         if people == 0:
             message = "상반신이 보이게 서면 아바타가 따라합니다"
@@ -1497,9 +1548,12 @@ def run(args: argparse.Namespace) -> int:
                         debug_logged = now
             if now - fps_shown_at >= 0.5:  # 화면 FPS 숫자는 0.5초마다만 바꾼다 (안내 패널 다시 그리기 줄이기)
                 fps_shown, fps_shown_at = fps, now
+            # 창 크기에 맞춘 뒤 글자·선을 그린다 (OpenCV가 창 크기로 줄이면 글자가 깨짐)
+            view, _ = fit_to_window(WINDOW, view)
             view = draw_hud(view, fps_shown, len(poses), mirror, show_skeleton, font, font_small)
+            avatar_view, avatar_display = fit_to_window(AVATAR_WINDOW, avatar_view)
             if show_collimator or collimator.editing:
-                avatar_view = collimator.draw(avatar_view)
+                avatar_view = collimator.draw(avatar_view, avatar_display)
             # 안내 문구는 콜리메이터 덮개 위에 그려야 박스 바깥에서도 보인다
             avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
             if collimator.editing:
