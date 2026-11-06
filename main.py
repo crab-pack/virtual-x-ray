@@ -905,7 +905,7 @@ def load_collimator() -> np.ndarray | None:
     path = ROOT / "collimator_light.png"
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None or image.ndim != 3 or image.shape[2] != 4:
-        print("collimator_light.png 를 찾지 못해 조명 오버레이를 건너뜁니다.")
+        log.warning("collimator_light.png 를 찾지 못해 조명 오버레이를 건너뜁니다.")
         return None
     return image
 
