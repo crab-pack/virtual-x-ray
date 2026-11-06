@@ -539,6 +539,13 @@ def rest_avatar() -> tuple[np.ndarray, np.ndarray]:
 REST_POINTS, REST_VIS = rest_avatar()
 
 
+# 뼈 메시의 팔 길이 비율 (어깨 관절 사이 거리 0.304m 기준: 위팔 0.286m, 아래팔 0.276~0.282m)
+UPPER_ARM_RATIO = 0.94
+FOREARM_RATIO = 0.92
+# 어깨 기준 손목·팔꿈치 깊이(앞뒤) 허용 범위 (뒤쪽, 앞쪽). MediaPipe 깊이는 크기가 부정확해서 자른다.
+ARM_DEPTH_RANGE = (0.12, 0.35)
+
+
 def _arms_from_image(view: np.ndarray, pose: np.ndarray, aspect: float) -> np.ndarray:
     """팔의 화면상 위치는 웹캠 골격을 따른다.
 
@@ -560,13 +567,54 @@ def _arms_from_image(view: np.ndarray, pose: np.ndarray, aspect: float) -> np.nd
             continue
         out[index, 0] = rel[index, 0]
         out[index, 1] = rel[index, 1]
-    for shoulder, chain in ((11, (13, 15, 17, 19, 21)), (12, (14, 16, 18, 20, 22))):
+    for shoulder, elbow, wrist, hand in ((11, 13, 15, (17, 19, 21)), (12, 14, 16, (18, 20, 22))):
         base = float(np.clip(out[shoulder, 2], -0.2, 0.2))
         out[shoulder, 2] = base
-        for joint in chain:
-            depth = float(out[joint, 2] - out[shoulder, 2])
-            out[joint, 2] = base + float(np.clip(depth, -0.12, 0.42))
+        if min(float(pose[i, 3]) for i in (shoulder, elbow, wrist)) < 0.2:
+            for joint in (elbow, wrist) + hand:
+                depth = float(view[joint, 2] - view[shoulder, 2])
+                out[joint, 2] = base + float(np.clip(depth, -0.12, 0.42))
+            continue
+        # 손목 위치를 목표로 두고, 아바타 자신의 팔 길이로 팔꿈치 위치를 푼다(2본 IK).
+        # 사람과 아바타의 팔 비율이 달라도 손이 화면 속 손목 자리(예: 얼굴 앞)에 닿는다.
+        def depth_of(joint: int) -> float:
+            return base + float(np.clip(view[joint, 2] - view[shoulder, 2], -ARM_DEPTH_RANGE[0], ARM_DEPTH_RANGE[1]))
+
+        old_wrist = out[wrist].copy()
+        target = np.array([out[wrist, 0], out[wrist, 1], depth_of(wrist)], dtype=np.float32)
+        pole = np.array([out[elbow, 0], out[elbow, 1], depth_of(elbow)], dtype=np.float32)
+        elbow_pt, wrist_pt = _two_bone_ik(
+            out[shoulder], target, pole, UPPER_ARM_RATIO * world_span, FOREARM_RATIO * world_span
+        )
+        out[elbow] = elbow_pt
+        out[wrist] = wrist_pt
+        for joint in hand:  # 손 점들은 손목이 옮겨진 만큼 함께 옮긴다
+            out[joint, :2] += wrist_pt[:2] - old_wrist[:2]
+            out[joint, 2] = wrist_pt[2] + float(np.clip(view[joint, 2] - view[wrist, 2], -0.1, 0.1))
     return out
+
+
+def _two_bone_ik(
+    shoulder: np.ndarray, target: np.ndarray, pole: np.ndarray, upper: float, fore: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """어깨에서 길이 upper, fore인 두 뼈로 target에 닿는 (팔꿈치, 손목). 팔꿈치는 pole 쪽으로 굽힌다."""
+    s = shoulder.astype(np.float64)
+    to = target.astype(np.float64) - s
+    dist = float(np.linalg.norm(to))
+    if dist < 1e-6:
+        return pole.astype(np.float32), target.astype(np.float32)
+    u = to / dist
+    dist = float(np.clip(dist, abs(upper - fore) + 1e-4, upper + fore - 1e-4))  # 닿지 않으면 그 방향으로 최대한
+    along = (upper * upper - fore * fore + dist * dist) / (2.0 * dist)
+    height = float(np.sqrt(max(upper * upper - along * along, 0.0)))
+    bend = pole.astype(np.float64) - s
+    bend -= (bend @ u) * u
+    if float(np.linalg.norm(bend)) < 1e-6:
+        bend = np.array([0.0, -1.0, 0.0]) - u[1] * u  # 팔꿈치 방향을 모르면 아래쪽으로
+    bend /= max(float(np.linalg.norm(bend)), 1e-6)
+    elbow = s + u * along + bend * height
+    wrist = s + u * dist
+    return elbow.astype(np.float32), wrist.astype(np.float32)
 
 
 def world_to_avatar(world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
