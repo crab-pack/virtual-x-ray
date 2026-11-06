@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import threading
 import time
@@ -25,6 +26,8 @@ if sys.platform == "win32":
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+log = logging.getLogger("virtual_xray")
 
 ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT / "models"
@@ -90,21 +93,25 @@ def download_model(name: str) -> Path:
         return dest
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".part")
-    print(f"포즈 모델을 받는 중입니다 ({name}).")
+    log.info("포즈 모델을 받는 중입니다 (%s).", name)
+    next_step = [25]
 
     def hook(count: int, block: int, total: int) -> None:
-        if total <= 0 or count % 40 != 0:
+        if total <= 0:
             return
         pct = min(100, int(count * block * 100 / total))
-        print(f"\r  {pct:3d}%", end="", flush=True)
+        # 로그는 줄을 덮어쓸 수 없으므로 25% 단위로 한 줄씩 남긴다.
+        while next_step[0] <= 100 and pct >= next_step[0]:
+            log.info("  다운로드 %d%%", next_step[0])
+            next_step[0] += 25
 
     try:
         urllib.request.urlretrieve(url, tmp, hook)
     except Exception as exc:
         if tmp.exists():
             tmp.unlink()
-        raise SystemExit(f"모델 다운로드 실패: {exc}\n주소: {url}") from exc
-    print()
+        log.error("모델 다운로드 실패: %s\n주소: %s", exc, url)
+        raise SystemExit(1) from exc
     tmp.replace(dest)
     return dest
 
@@ -148,10 +155,13 @@ class Camera:
                 return cap
             errors.append(f"backend {backend} 프레임 없음")
             cap.release()
-        raise SystemExit(
-            f"카메라 {index}번을 열지 못했습니다. 다른 앱이 카메라를 쓰는 중인지 확인하거나 "
-            f"--camera 번호를 바꿔 보세요.\n" + "\n".join(errors)
+        log.error(
+            "카메라 %d번을 열지 못했습니다. 다른 앱이 카메라를 쓰는 중인지 확인하거나 "
+            "--camera 번호를 바꿔 보세요.\n%s",
+            index,
+            "\n".join(errors),
         )
+        raise SystemExit(1)
 
     def _loop(self) -> None:
         while not self.stopped:
@@ -342,6 +352,14 @@ def _px(point: np.ndarray, width: int, height: int) -> tuple[int, int]:
 
 def _visible(pose: np.ndarray, index: int) -> bool:
     return float(pose[index, 3]) >= VIS_MIN
+
+
+def seen_landmarks(pose: np.ndarray | None) -> np.ndarray | None:
+    """웹캠 화면 안에 실제로 잡힌 랜드마크만 True."""
+    if pose is None:
+        return None
+    x, y, vis = pose[:, 0], pose[:, 1], pose[:, 3]
+    return (vis >= VIS_MIN) & (x >= 0.0) & (x <= 1.0) & (y >= 0.0) & (y <= 1.0)
 
 
 def draw_connections(
@@ -887,7 +905,7 @@ def load_collimator() -> np.ndarray | None:
     path = ROOT / "collimator_light.png"
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None or image.ndim != 3 or image.shape[2] != 4:
-        print("collimator_light.png 를 찾지 못해 조명 오버레이를 건너뜁니다.")
+        log.warning("collimator_light.png 를 찾지 못해 조명 오버레이를 건너뜁니다.")
         return None
     return image
 
@@ -947,11 +965,127 @@ def draw_avatar_hud(
     return cv2.cvtColor(np.array(merged), cv2.COLOR_RGB2BGR)
 
 
-def primary_pose(poses: list[np.ndarray]) -> np.ndarray | None:
+def primary_index(poses: list[np.ndarray]) -> int | None:
     if not poses:
         return None
     scores = [float(np.mean(pose[:, 3])) for pose in poses]
-    return poses[int(np.argmax(scores))]
+    return int(np.argmax(scores))
+
+
+def primary_pose(poses: list[np.ndarray]) -> np.ndarray | None:
+    index = primary_index(poses)
+    return None if index is None else poses[index]
+
+
+def presence_from_result(result) -> list[np.ndarray]:
+    """랜드마크별 presence(화면 안에 있을 가능성). 디버그 표시용."""
+    out = []
+    for landmarks in result.pose_landmarks or []:
+        arr = np.full(33, np.nan, dtype=np.float32)
+        for i, lm in enumerate(landmarks[:33]):
+            value = getattr(lm, "presence", None)
+            if value is not None:
+                arr[i] = float(value)
+        out.append(arr)
+    return out
+
+
+DIAG_POINTS = (0, 7, 8) + tuple(range(11, 33))
+DIAG_ARM = (("어깨", 0), ("팔꿈치", 1), ("손목", 2))
+DIAG_GREEN = (90, 230, 90)    # RGB
+DIAG_RED = (255, 80, 80)
+
+
+def _fmt(value: float) -> str:
+    return " -- " if np.isnan(value) else f"{value:4.2f}"
+
+
+def diag_rows(
+    raw: np.ndarray,
+    smooth: np.ndarray,
+    presence: np.ndarray,
+    seen: np.ndarray,
+) -> list[tuple[str, list[tuple[str, int]]]]:
+    """화면 왼쪽/오른쪽 팔별로 (제목, [(관절 이름, 랜드마크 번호)]) 목록."""
+    left_series = (11, 13, 15)
+    right_series = (12, 14, 16)
+    # 화면에서 왼쪽에 있는 팔을 먼저 보여준다. (거울 모드면 본인 왼팔)
+    if float(raw[11, 0]) > float(raw[12, 0]):
+        left_series, right_series = right_series, left_series
+    rows = []
+    for title, series in (("화면 왼쪽 팔", left_series), ("화면 오른쪽 팔", right_series)):
+        rows.append((title, [(name, series[k]) for name, k in DIAG_ARM]))
+    return rows
+
+
+def draw_seen_debug(
+    frame: np.ndarray,
+    raw: np.ndarray,
+    smooth: np.ndarray,
+    presence: np.ndarray,
+    seen: np.ndarray,
+    font_small: ImageFont.ImageFont,
+) -> np.ndarray:
+    """콜리메이터 박스가 '보인다'고 판정한 관절을 카메라 창에 표시한다.
+
+    채운 점: 박스 판정에 쓰는 보정 후 좌표 (초록=보임, 빨강=안 보임)
+    빈 원: MediaPipe 원본 좌표. 둘이 떨어져 있으면 보정 좌표가 굳어 있는 것.
+    """
+    height, width = frame.shape[:2]
+    for index in DIAG_POINTS:
+        color = DIAG_GREEN if bool(seen[index]) else DIAG_RED
+        bgr = color[::-1]
+        p_smooth = _px(smooth[index], width, height)
+        p_raw = _px(raw[index], width, height)
+        if abs(p_smooth[0] - p_raw[0]) + abs(p_smooth[1] - p_raw[1]) > 4:
+            cv2.line(frame, p_smooth, p_raw, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.circle(frame, p_raw, 8, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.circle(frame, p_smooth, 6, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(frame, p_smooth, 5, bgr, -1, cv2.LINE_AA)
+
+    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    panel_w, line_h = 470, 22
+    rows = diag_rows(raw, smooth, presence, seen)
+    lines = 2 + sum(1 + len(items) for _, items in rows)
+    x0 = width - panel_w - 16
+    y = 16
+    draw.rounded_rectangle((x0, y, width - 16, y + 16 + lines * line_h), radius=12, fill=(6, 14, 24, 200))
+    x = x0 + 14
+    y += 8
+    draw.text((x, y), "디버그: 보이는 부위 판정 (B 끄기)", font=font_small, fill=(236, 246, 255, 255))
+    y += line_h
+    draw.text((x, y), "관절      vis   pres   x     y    판정", font=font_small, fill=(160, 180, 196, 255))
+    y += line_h
+    for title, items in rows:
+        draw.text((x, y), title, font=font_small, fill=(236, 246, 255, 255))
+        y += line_h
+        for name, index in items:
+            ok = bool(seen[index])
+            text = (
+                f"  {name:<4} {_fmt(float(raw[index, 3]))}  {_fmt(float(presence[index]))}"
+                f"  {float(raw[index, 0]):5.2f} {float(raw[index, 1]):5.2f}   {'보임' if ok else '없음'}"
+            )
+            draw.text((x, y), text, font=font_small, fill=(*(DIAG_GREEN if ok else DIAG_RED), 255))
+            y += line_h
+    merged = Image.alpha_composite(image, overlay).convert("RGB")
+    return cv2.cvtColor(np.array(merged), cv2.COLOR_RGB2BGR)
+
+
+def diag_log_line(raw: np.ndarray, smooth: np.ndarray, presence: np.ndarray, seen: np.ndarray) -> str:
+    parts = []
+    for title, items in diag_rows(raw, smooth, presence, seen):
+        cells = []
+        for name, index in items:
+            drift = float(np.linalg.norm(smooth[index, :2] - raw[index, :2]))
+            cells.append(
+                f"{name} v{_fmt(float(raw[index, 3])).strip()} p{_fmt(float(presence[index])).strip()}"
+                f" ({float(raw[index, 0]):.2f},{float(raw[index, 1]):.2f})"
+                f" 굳음{drift:.2f} {'O' if bool(seen[index]) else 'X'}"
+            )
+        parts.append(f"{title}: " + ", ".join(cells))
+    return " | ".join(parts)
 
 
 def primary_world(worlds: list[np.ndarray], poses: list[np.ndarray]) -> np.ndarray | None:
@@ -984,10 +1118,10 @@ def draw_hud(
         font=font_small,
         fill=(186, 214, 230, 255),
     )
-    tracking = "자세한 골격 표시 중" if skeleton_on else "라인 골격 표시 중"
+    tracking = "추가기능 골격 표시 중" if skeleton_on else "라인 골격 표시 중"
     draw.text((32, 92), tracking, font=font_small, fill=(186, 214, 230, 255))
 
-    help_text = "Q 종료    M 반전    V 자세히    S 저장"
+    help_text = "Q 종료    M 반전    V 추가기능    B 디버그    S 저장"
     box = draw.textbbox((0, 0), help_text, font=font_small)
     text_w = box[2] - box[0]
     bar_x = max(16, (width - text_w) // 2 - 18)
@@ -1021,13 +1155,13 @@ def self_test(model_name: str) -> int:
     finally:
         landmarker.close()
     count = len(result.pose_landmarks or [])
-    print(f"self-test ok  model={model_path.name}  poses={count}")
+    log.info("self-test ok  model=%s  poses=%d", model_path.name, count)
     return 0
 
 
 def run(args: argparse.Namespace) -> int:
     model_path = download_model(args.model)
-    print("포즈 모델을 불러오는 중입니다.", flush=True)
+    log.info("포즈 모델을 불러오는 중입니다.")
     landmarker, mp = create_landmarker(model_path, args.poses)
     camera = Camera(args.camera, args.width, args.height)
     smoother = PoseSmoother()
@@ -1045,6 +1179,8 @@ def run(args: argparse.Namespace) -> int:
     xray = False
     glow = True
     detailed_face = False
+    debug_mode = False
+    debug_logged = 0.0
     fps = 0.0
     last = time.perf_counter()
     clock_origin = last
@@ -1055,14 +1191,14 @@ def run(args: argparse.Namespace) -> int:
     cv2.namedWindow(AVATAR_WINDOW, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW, 800, 450)
     cv2.resizeWindow(AVATAR_WINDOW, 480, 700)
-    print("카메라 창과 뼈 아바타 창을 열었습니다. Q 또는 Esc 로 종료합니다.", flush=True)
+    log.info("카메라 창과 뼈 아바타 창을 열었습니다. Q 또는 Esc 로 종료합니다.")
 
     try:
         while True:
             frame = camera.read()
             if frame is None:
                 if time.perf_counter() - clock_origin > 5:
-                    print("카메라 프레임을 받지 못했습니다.")
+                    log.error("카메라 프레임을 받지 못했습니다.")
                     return 1
                 time.sleep(0.01)
                 continue
@@ -1078,7 +1214,9 @@ def run(args: argparse.Namespace) -> int:
 
             image = infer_image(frame, mp)
             result = landmarker.detect_for_video(image, stamp)
-            poses, worlds = smoother.update(*poses_from_result(result))
+            raw_poses, raw_worlds = poses_from_result(result)
+            presences = presence_from_result(result) if debug_mode else []
+            poses, worlds = smoother.update(raw_poses, raw_worlds)
             aspect = frame.shape[1] / max(frame.shape[0], 1)
             avatar.observe(primary_world(worlds, poses), primary_pose(poses), aspect, now)
             avatar.follow_image(primary_pose(poses))
@@ -1105,6 +1243,15 @@ def run(args: argparse.Namespace) -> int:
             if dt > 0:
                 fps = fps * 0.9 + (1.0 / dt) * 0.1 if fps else 1.0 / dt
 
+            if debug_mode and poses:
+                index = primary_index(poses)
+                if index is not None and index < len(raw_poses) and index < len(presences):
+                    raw, smooth, presence = raw_poses[index], poses[index], presences[index]
+                    seen = seen_landmarks(smooth)
+                    view = draw_seen_debug(view, raw, smooth, presence, seen, font_small)
+                    if now - debug_logged >= 1.0:
+                        log.debug(diag_log_line(raw, smooth, presence, seen))
+                        debug_logged = now
             view = draw_hud(view, fps, len(poses), mirror, show_skeleton, font, font_small)
             avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
             if show_collimator and collimator is not None:
@@ -1133,6 +1280,11 @@ def run(args: argparse.Namespace) -> int:
                 glow = not glow
             elif key in (ord("f"), ord("F")):
                 detailed_face = not detailed_face
+            elif key in (ord("b"), ord("B")):
+                debug_mode = not debug_mode
+                # 디버그 중에는 콘솔 출력 레벨을 DEBUG로 낮추고, 끄면 INFO로 되돌린다.
+                log.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+                log.info("디버그 %s (콘솔 레벨 %s)", "켜짐" if debug_mode else "꺼짐", logging.getLevelName(log.level))
             elif key in (ord("a"), ord("A")):
                 avatar.yaw -= 0.08
             elif key in (ord("d"), ord("D")):
@@ -1158,8 +1310,8 @@ def run(args: argparse.Namespace) -> int:
                 avatar_path = SHOT_DIR / f"avatar_{stamp_name}.png"
                 cv2.imwrite(str(camera_path), view)
                 cv2.imwrite(str(avatar_path), avatar_view)
-                print(f"저장: {camera_path}")
-                print(f"저장: {avatar_path}")
+                log.info("저장: %s", camera_path)
+                log.info("저장: %s", avatar_path)
 
             if now - clock_origin > 0.8:
                 for name in (WINDOW, AVATAR_WINDOW):
@@ -1187,12 +1339,21 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def setup_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
 def main() -> int:
+    setup_logging()
     args = parse_args()
     if args.inspect_glb:
         from avatar_mesh import describe_glb
 
-        print(describe_glb(ROOT / "assets" / "skeleton.glb"))
+        log.info("%s", describe_glb(ROOT / "assets" / "skeleton.glb"))
         return 0
     if args.self_test:
         return self_test(args.model)

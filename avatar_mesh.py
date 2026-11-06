@@ -6,10 +6,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import struct
 from pathlib import Path
 
 import numpy as np
+
+# main.py의 "virtual_xray" 로거 아래에 두어 같은 출력 형식과 레벨을 따른다.
+log = logging.getLogger("virtual_xray.avatar")
 
 # 골반부터 머리까지는 카메라 앞뒤(z)로 숙이지 않고 수직을 유지한다.
 _UPRIGHT_BONES = {"Hips", "Spine02", "Spine01", "Spine", "neck", "Head"}
@@ -52,12 +56,12 @@ def load_bone_avatar(path: Path | None = None, bone_map: Path | None = None):
     path = path or DEFAULT_GLB
     bone_map = bone_map or DEFAULT_MAP
     if not path.exists():
-        print("뼈 메시 파일이 없어 캡슐 아바타를 사용합니다.")
+        log.warning("뼈 메시 파일이 없어 캡슐 아바타를 사용합니다.")
         return None
     try:
         return BoneAvatar(path, bone_map)
     except Exception as exc:
-        print(f"뼈 메시를 열지 못해 캡슐 아바타를 사용합니다: {exc}")
+        log.warning("뼈 메시를 열지 못해 캡슐 아바타를 사용합니다: %s", exc)
         return None
 
 
@@ -80,10 +84,7 @@ class BoneAvatar:
 
         self.ctx = moderngl.create_context(standalone=True)
         self._init_gl()
-        print(
-            f"뼈 메시를 불러왔습니다. 삼각형 {len(self.indices) // 3}, 본 {len(self.skin_joints)}.",
-            flush=True,
-        )
+        log.info("뼈 메시를 불러왔습니다. 삼각형 %d, 본 %d.", len(self.indices) // 3, len(self.skin_joints))
 
     def _check_aims(self) -> None:
         for bone, child in self.aims:
