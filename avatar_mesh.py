@@ -83,6 +83,9 @@ class BoneAvatar:
         self.skin_joints, self.inverse_bind = _load_skin(gltf, blob)
         self.positions, self.normals, self.joints, self.weights, self.indices = _load_mesh(gltf, blob)
         self.bind_world = _bind_world(self.nodes)
+        self.joints, self.weights = _lock_shafts(
+            self.positions, self.joints, self.weights, self.skin_joints, self.bind_world, self.nodes
+        )
         self.by_name = {node.name: node.index for node in self.nodes if node.name}
         hips = self.bind_world[self.by_name["Hips"]]
         self.hip_pos = hips[:3, 3].copy()
@@ -444,6 +447,57 @@ def _load_skin(gltf: dict, blob: bytes) -> tuple[list[int], np.ndarray]:
     mats = _read_accessor(gltf, blob, skin["inverseBindMatrices"]).reshape(len(joints), 4, 4)
     mats = np.transpose(mats, (0, 2, 1)).astype(np.float32)
     return joints, mats
+
+
+def _lock_shafts(positions, joint_idx, weights, skin_joints, bind_world, nodes):
+    """관절에서 떨어진 뼈대는 가장 가까운 본 하나만 따른다.
+
+    가중치가 여러 본에 나뉘면 팔뼈·다리뼈 중간이 관절처럼 휘어진다.
+    """
+    node_slot = {node: slot for slot, node in enumerate(skin_joints)}
+    origins = np.stack([bind_world[node][:3, 3] for node in skin_joints]).astype(np.float64)
+    segments: list[tuple[int, np.ndarray, np.ndarray, float]] = []
+    for slot, node in enumerate(skin_joints):
+        for child in nodes[node].children:
+            child_slot = node_slot.get(child)
+            if child_slot is None:
+                continue
+            start = origins[slot]
+            end = origins[child_slot]
+            length = float(np.linalg.norm(end - start))
+            if length < 1e-4:
+                continue
+            segments.append((slot, start, end, length))
+    if not segments:
+        return joint_idx, weights
+
+    count = len(positions)
+    best_dist = np.full(count, np.inf)
+    best_from_end = np.full(count, np.inf)
+    best_slot = np.zeros(count, dtype=np.int32)
+    joint_radius = np.full(count, np.inf)
+    points = positions.astype(np.float64)
+    for slot, start, end, length in segments:
+        span = end - start
+        along = np.clip(((points - start) @ span) / float(span @ span), 0.0, 1.0)
+        closest = start + along[:, None] * span
+        dist = np.linalg.norm(points - closest, axis=1)
+        from_end = np.minimum(along, 1.0 - along) * length
+        nearer = dist < best_dist
+        best_dist = np.where(nearer, dist, best_dist)
+        best_from_end = np.where(nearer, from_end, best_from_end)
+        best_slot = np.where(nearer, slot, best_slot)
+        joint_radius = np.where(nearer, float(np.clip(length * 0.22, 0.012, 0.045)), joint_radius)
+
+    # 뼈대에서 3.5cm 안이고, 양쪽 관절 뭉치 밖인 정점만 고정한다.
+    snap = (best_dist < 0.035) & (best_from_end > joint_radius)
+    locked_weights = weights.copy()
+    locked_joints = joint_idx.copy()
+    locked_weights[snap] = 0.0
+    locked_weights[snap, 0] = 1.0
+    locked_joints[snap, 0] = best_slot[snap]
+    locked_joints[snap, 1:] = 0.0
+    return locked_joints.astype(np.float32), locked_weights.astype(np.float32)
 
 
 def _load_mesh(gltf: dict, blob: bytes):
