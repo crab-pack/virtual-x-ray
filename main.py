@@ -1079,7 +1079,7 @@ def draw_collimator_hint(frame: np.ndarray, font_small: ImageFont.ImageFont) -> 
     box = draw.textbbox((0, 0), message, font=font_small)
     text_w = box[2] - box[0]
     x = max(16, (image.size[0] - text_w) // 2)
-    y = 118
+    y = 160  # 대기 중 안내 문구(y=118)와 겹치지 않게 그 아래에
     draw.rounded_rectangle((x - 16, y - 8, x + text_w + 16, y + 28), radius=12, fill=(10, 60, 90, 220))
     draw.text((x, y), message, font=font_small, fill=(236, 248, 255, 255))
     merged = Image.alpha_composite(image, overlay).convert("RGB")
@@ -1452,9 +1452,10 @@ def run(args: argparse.Namespace) -> int:
                             log.debug("손가락(도) 손 %d개 인식, 짝 %s | %s", len(hands), sorted(matched), fingers.summary())
                         debug_logged = now
             view = draw_hud(view, fps, len(poses), mirror, show_skeleton, font, font_small)
-            avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
             if show_collimator or collimator.editing:
                 avatar_view = collimator.draw(avatar_view)
+            # 안내 문구는 콜리메이터 덮개 위에 그려야 박스 바깥에서도 보인다
+            avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
             if collimator.editing:
                 avatar_view = draw_collimator_hint(avatar_view, font_small)
             cv2.imshow(WINDOW, view)
