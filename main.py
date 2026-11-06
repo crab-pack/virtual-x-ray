@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -1072,18 +1073,57 @@ class Collimator:
 
 def draw_collimator_hint(frame: np.ndarray, font_small: ImageFont.ImageFont) -> np.ndarray:
     """편집 모드 안내 문구 (콜리메이터 덮개 위에 그려서 어둡게 가려지지 않게)."""
-    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    message = "콜리메이터 편집 중 · 꼭짓점 드래그: 크기 · 안쪽 드래그: 위치 · L: 고정"
-    box = draw.textbbox((0, 0), message, font=font_small)
-    text_w = box[2] - box[0]
-    x = max(16, (image.size[0] - text_w) // 2)
-    y = 160  # 대기 중 안내 문구(y=118)와 겹치지 않게 그 아래에
-    draw.rounded_rectangle((x - 16, y - 8, x + text_w + 16, y + 28), radius=12, fill=(10, 60, 90, 220))
-    draw.text((x, y), message, font=font_small, fill=(236, 248, 255, 255))
-    merged = Image.alpha_composite(image, overlay).convert("RGB")
-    return cv2.cvtColor(np.array(merged), cv2.COLOR_RGB2BGR)
+
+    def paint(draw: ImageDraw.ImageDraw, width: int, _height: int) -> None:
+        message = "콜리메이터 편집 중 · 꼭짓점 드래그: 크기 · 안쪽 드래그: 위치 · L: 고정"
+        box = draw.textbbox((0, 0), message, font=font_small)
+        text_w = box[2] - box[0]
+        x = max(16, (width - text_w) // 2)
+        y = 160  # 대기 중 안내 문구(y=118)와 겹치지 않게 그 아래에
+        draw.rounded_rectangle((x - 16, y - 8, x + text_w + 16, y + 28), radius=12, fill=(10, 60, 90, 220))
+        draw.text((x, y), message, font=font_small, fill=(236, 248, 255, 255))
+
+    return HUD_CACHE.apply(frame, ("collimator-hint",), paint)
+
+
+class OverlayCache:
+    """PIL로 그린 반투명 안내 패널을 캐시해 두고, 매 프레임 패널이 있는 영역만 섞는다.
+
+    전체 화면을 PIL로 바꿔 그리면 프레임마다 30ms 넘게 걸려서, 글자가 바뀔 때만 다시 그린다.
+    """
+
+    def __init__(self, limit: int = 48) -> None:
+        self.limit = limit
+        # 키 -> [(영역, 패널 색 uint8, 패널 가중치, 바탕 가중치)]
+        self._items: dict[tuple, list[tuple[tuple[slice, slice], np.ndarray, np.ndarray, np.ndarray]]] = {}
+
+    def apply(self, frame: np.ndarray, key: tuple, paint) -> np.ndarray:
+        height, width = frame.shape[:2]
+        full_key = (width, height) + tuple(key)
+        item = self._items.get(full_key)
+        if item is None:
+            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            paint(ImageDraw.Draw(overlay), width, height)
+            rgba = np.array(overlay)
+            bgr = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2BGR)
+            alpha = rgba[:, :, 3].astype(np.float32) / 255.0
+            count, _labels, stats, _ = cv2.connectedComponentsWithStats((rgba[:, :, 3] > 0).astype(np.uint8))
+            item = []
+            for i in range(1, count):
+                x, y, w, h = (int(v) for v in stats[i, :4])
+                region = (slice(y, y + h), slice(x, x + w))
+                a = np.ascontiguousarray(alpha[region])
+                item.append((region, np.ascontiguousarray(bgr[region]), a, np.ascontiguousarray(1.0 - a)))
+            if len(self._items) >= self.limit:
+                self._items.pop(next(iter(self._items)))
+            self._items[full_key] = item
+        out = frame.copy()
+        for region, color, weight, rest in item:
+            out[region] = cv2.blendLinear(color, np.ascontiguousarray(out[region]), weight, rest)
+        return out
+
+
+HUD_CACHE = OverlayCache()
 
 
 def draw_avatar_hud(
@@ -1092,33 +1132,29 @@ def draw_avatar_hud(
     font: ImageFont.ImageFont,
     font_small: ImageFont.ImageFont,
 ) -> np.ndarray:
-    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    width, height = image.size
-    draw.rounded_rectangle((16, 16, 280, 96), radius=14, fill=(8, 12, 18, 170))
-    draw.text((32, 26), "뼈 아바타", font=font, fill=(236, 244, 248, 255))
-    status = "추적 중" if live else "대기"
-    draw.text((32, 60), status, font=font_small, fill=(186, 214, 230, 255))
+    def paint(draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
+        draw.rounded_rectangle((16, 16, 280, 96), radius=14, fill=(8, 12, 18, 170))
+        draw.text((32, 26), "뼈 아바타", font=font, fill=(236, 244, 248, 255))
+        status = "추적 중" if live else "대기"
+        draw.text((32, 60), status, font=font_small, fill=(186, 214, 230, 255))
 
-    help_text = "방향키 위치    + - 확대    A D 회전    C 조명    L 조명 맞추기    R 초기화"
-    box = draw.textbbox((0, 0), help_text, font=font_small)
-    text_w = box[2] - box[0]
-    bar_x = max(16, (width - text_w) // 2 - 18)
-    draw.rounded_rectangle((bar_x, height - 52, bar_x + text_w + 36, height - 16), radius=12, fill=(8, 12, 18, 170))
-    draw.text((bar_x + 18, height - 44), help_text, font=font_small, fill=(226, 236, 244, 255))
-
-    if not live:
-        message = "카메라에 몸이 보이면 따라 움직입니다"
-        box = draw.textbbox((0, 0), message, font=font_small)
+        help_text = "방향키 위치    + - 확대    A D 회전    C 조명    L 조명 맞추기    R 초기화"
+        box = draw.textbbox((0, 0), help_text, font=font_small)
         text_w = box[2] - box[0]
-        x = (width - text_w) // 2
-        y = 118
-        draw.rounded_rectangle((x - 16, y - 8, x + text_w + 16, y + 28), radius=12, fill=(8, 12, 18, 160))
-        draw.text((x, y), message, font=font_small, fill=(236, 244, 248, 255))
+        bar_x = max(16, (width - text_w) // 2 - 18)
+        draw.rounded_rectangle((bar_x, height - 52, bar_x + text_w + 36, height - 16), radius=12, fill=(8, 12, 18, 170))
+        draw.text((bar_x + 18, height - 44), help_text, font=font_small, fill=(226, 236, 244, 255))
 
-    merged = Image.alpha_composite(image, overlay).convert("RGB")
-    return cv2.cvtColor(np.array(merged), cv2.COLOR_RGB2BGR)
+        if not live:
+            message = "카메라에 몸이 보이면 따라 움직입니다"
+            box = draw.textbbox((0, 0), message, font=font_small)
+            text_w = box[2] - box[0]
+            x = (width - text_w) // 2
+            y = 118
+            draw.rounded_rectangle((x - 16, y - 8, x + text_w + 16, y + 28), radius=12, fill=(8, 12, 18, 160))
+            draw.text((x, y), message, font=font_small, fill=(236, 244, 248, 255))
+
+    return HUD_CACHE.apply(frame, ("avatar", live), paint)
 
 
 def primary_index(poses: list[np.ndarray]) -> int | None:
@@ -1260,45 +1296,37 @@ def draw_hud(
     font: ImageFont.ImageFont,
     font_small: ImageFont.ImageFont,
 ) -> np.ndarray:
-    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    width, height = image.size
-
-    draw.rounded_rectangle((16, 16, 430, 132), radius=14, fill=(6, 14, 24, 168))
-    draw.text((32, 26), "카메라", font=font, fill=(236, 246, 255, 255))
     mirror_text = "켜짐" if mirror else "꺼짐"
-    draw.text(
-        (32, 64),
-        f"FPS {fps:4.1f}    사람 {people}    반전 {mirror_text}",
-        font=font_small,
-        fill=(186, 214, 230, 255),
-    )
+    status = f"FPS {fps:4.1f}    사람 {people}    반전 {mirror_text}"
     tracking = "추가기능 골격 표시 중" if skeleton_on else "라인 골격 표시 중"
-    draw.text((32, 92), tracking, font=font_small, fill=(186, 214, 230, 255))
 
-    help_text = "Q 종료    M 반전    V 추가기능    H 손가락    B 디버그    S 저장"
-    box = draw.textbbox((0, 0), help_text, font=font_small)
-    text_w = box[2] - box[0]
-    bar_x = max(16, (width - text_w) // 2 - 18)
-    draw.rounded_rectangle(
-        (bar_x, height - 52, bar_x + text_w + 36, height - 16),
-        radius=12,
-        fill=(6, 14, 24, 168),
-    )
-    draw.text((bar_x + 18, height - 44), help_text, font=font_small, fill=(226, 238, 246, 255))
+    def paint(draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
+        draw.rounded_rectangle((16, 16, 430, 132), radius=14, fill=(6, 14, 24, 168))
+        draw.text((32, 26), "카메라", font=font, fill=(236, 246, 255, 255))
+        draw.text((32, 64), status, font=font_small, fill=(186, 214, 230, 255))
+        draw.text((32, 92), tracking, font=font_small, fill=(186, 214, 230, 255))
 
-    if people == 0:
-        message = "상반신이 보이게 서면 아바타가 따라합니다"
-        box = draw.textbbox((0, 0), message, font=font)
+        help_text = "Q 종료    M 반전    V 추가기능    H 손가락    B 디버그    S 저장"
+        box = draw.textbbox((0, 0), help_text, font=font_small)
         text_w = box[2] - box[0]
-        x = (width - text_w) // 2
-        y = height // 2 - 18
-        draw.rounded_rectangle((x - 18, y - 10, x + text_w + 18, y + 40), radius=12, fill=(6, 14, 24, 150))
-        draw.text((x, y), message, font=font, fill=(236, 246, 255, 255))
+        bar_x = max(16, (width - text_w) // 2 - 18)
+        draw.rounded_rectangle(
+            (bar_x, height - 52, bar_x + text_w + 36, height - 16),
+            radius=12,
+            fill=(6, 14, 24, 168),
+        )
+        draw.text((bar_x + 18, height - 44), help_text, font=font_small, fill=(226, 238, 246, 255))
 
-    merged = Image.alpha_composite(image, overlay).convert("RGB")
-    return cv2.cvtColor(np.array(merged), cv2.COLOR_RGB2BGR)
+        if people == 0:
+            message = "상반신이 보이게 서면 아바타가 따라합니다"
+            box = draw.textbbox((0, 0), message, font=font)
+            text_w = box[2] - box[0]
+            x = (width - text_w) // 2
+            y = height // 2 - 18
+            draw.rounded_rectangle((x - 18, y - 10, x + text_w + 18, y + 40), radius=12, fill=(6, 14, 24, 150))
+            draw.text((x, y), message, font=font, fill=(236, 246, 255, 255))
+
+    return HUD_CACHE.apply(frame, ("camera", status, tracking, people == 0), paint)
 
 
 def self_test(model_name: str) -> int:
@@ -1357,6 +1385,7 @@ def run(args: argparse.Namespace) -> int:
     hand_tracker = open_hand_tracker() if hands_on else None
     hands_on = hand_tracker is not None
     fingers = FingerState()
+    hand_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hands")
 
     mirror = not args.no_mirror
     show_collimator = True
@@ -1367,9 +1396,36 @@ def run(args: argparse.Namespace) -> int:
     debug_mode = False
     debug_logged = 0.0
     fps = 0.0
+    fps_shown, fps_shown_at = 0.0, 0.0
     last = time.perf_counter()
     clock_origin = last
-    last_stamp = -1
+    last_stamp = [-1]  # 인식 스레드에서 갱신하므로 리스트로 감싼다
+    infer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
+
+    def capture(mirror_on: bool, hands_enabled: bool) -> dict | None:
+        """인식 스레드: 최신 카메라 프레임을 받아 자세·손 인식까지 마친다. 프레임이 없으면 None."""
+        deadline = time.perf_counter() + 0.5
+        frame = camera.read()
+        while frame is None and time.perf_counter() < deadline:
+            time.sleep(0.01)
+            frame = camera.read()
+        if frame is None:
+            return None
+        if mirror_on:
+            frame = cv2.flip(frame, 1)
+        now = time.perf_counter()
+        stamp = max(int((now - clock_origin) * 1000), last_stamp[0] + 1)
+        last_stamp[0] = stamp
+        image = infer_image(frame, mp)
+        # 손 인식은 또 다른 스레드에서 자세 인식과 동시에 돌린다 (MediaPipe가 추론 중 GIL을 풀어 줌)
+        hand_job = (
+            hand_pool.submit(hand_tracker.detect, image, stamp)
+            if hands_enabled and hand_tracker is not None
+            else None
+        )
+        result = landmarker.detect_for_video(image, stamp)
+        hands = hand_job.result() if hand_job is not None else []
+        return {"frame": frame, "now": now, "result": result, "hands": hands}
     placed = False
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
@@ -1381,26 +1437,17 @@ def run(args: argparse.Namespace) -> int:
     log.info("카메라 창과 뼈 아바타 창을 열었습니다. Q 또는 Esc 로 종료합니다.")
 
     try:
+        pending = infer_pool.submit(capture, mirror, hands_on)
         while True:
-            frame = camera.read()
-            if frame is None:
-                if time.perf_counter() - clock_origin > 5:
+            # 이번 프레임의 인식 결과를 받자마자 다음 프레임 인식을 시작해 두고, 그동안 이번 프레임을 그린다.
+            job = pending.result()
+            pending = infer_pool.submit(capture, mirror, hands_on)
+            if job is None:
+                if time.perf_counter() - clock_origin > 5 and last_stamp[0] < 0:
                     log.error("카메라 프레임을 받지 못했습니다.")
                     return 1
-                time.sleep(0.01)
                 continue
-
-            if mirror:
-                frame = cv2.flip(frame, 1)
-
-            now = time.perf_counter()
-            stamp = int((now - clock_origin) * 1000)
-            if stamp <= last_stamp:
-                stamp = last_stamp + 1
-            last_stamp = stamp
-
-            image = infer_image(frame, mp)
-            result = landmarker.detect_for_video(image, stamp)
+            frame, now, result, hands = job["frame"], job["now"], job["result"], job["hands"]
             raw_poses, raw_worlds = poses_from_result(result)
             presences = presence_from_result(result) if debug_mode else []
             poses, worlds = smoother.update(raw_poses, raw_worlds)
@@ -1410,10 +1457,7 @@ def run(args: argparse.Namespace) -> int:
             points, vis, live, scale = avatar.current(now)
             place_x, place_y, zoom = avatar.placement(live)
 
-            hands, matched = [], {}
-            if hands_on and hand_tracker is not None:
-                hands = hand_tracker.detect(image, stamp)
-                matched = match_hands(hands, primary_pose(poses))
+            matched = match_hands(hands, primary_pose(poses)) if hands else {}
             fingers.update(matched, now)
 
             view = frame
@@ -1451,7 +1495,9 @@ def run(args: argparse.Namespace) -> int:
                         if hands_on:
                             log.debug("손가락(도) 손 %d개 인식, 짝 %s | %s", len(hands), sorted(matched), fingers.summary())
                         debug_logged = now
-            view = draw_hud(view, fps, len(poses), mirror, show_skeleton, font, font_small)
+            if now - fps_shown_at >= 0.5:  # 화면 FPS 숫자는 0.5초마다만 바꾼다 (안내 패널 다시 그리기 줄이기)
+                fps_shown, fps_shown_at = fps, now
+            view = draw_hud(view, fps_shown, len(poses), mirror, show_skeleton, font, font_small)
             if show_collimator or collimator.editing:
                 avatar_view = collimator.draw(avatar_view)
             # 안내 문구는 콜리메이터 덮개 위에 그려야 박스 바깥에서도 보인다
@@ -1527,6 +1573,8 @@ def run(args: argparse.Namespace) -> int:
                     if cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) == 0:
                         return 0
     finally:
+        infer_pool.shutdown(wait=True)   # 진행 중인 인식이 끝난 뒤에 인식기를 닫는다
+        hand_pool.shutdown(wait=True)
         camera.close()
         landmarker.close()
         if hand_tracker is not None:
