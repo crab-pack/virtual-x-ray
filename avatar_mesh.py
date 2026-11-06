@@ -83,6 +83,9 @@ class BoneAvatar:
         self.skin_joints, self.inverse_bind = _load_skin(gltf, blob)
         self.positions, self.normals, self.joints, self.weights, self.indices = _load_mesh(gltf, blob)
         self.bind_world = _bind_world(self.nodes)
+        self.joints, self.weights = _lock_shafts(
+            self.positions, self.joints, self.weights, self.skin_joints, self.bind_world, self.nodes
+        )
         self.by_name = {node.name: node.index for node in self.nodes if node.name}
         hips = self.bind_world[self.by_name["Hips"]]
         self.hip_pos = hips[:3, 3].copy()
@@ -446,6 +449,57 @@ def _load_skin(gltf: dict, blob: bytes) -> tuple[list[int], np.ndarray]:
     return joints, mats
 
 
+def _lock_shafts(positions, joint_idx, weights, skin_joints, bind_world, nodes):
+    """관절에서 떨어진 뼈대는 가장 가까운 본 하나만 따른다.
+
+    가중치가 여러 본에 나뉘면 팔뼈·다리뼈 중간이 관절처럼 휘어진다.
+    """
+    node_slot = {node: slot for slot, node in enumerate(skin_joints)}
+    origins = np.stack([bind_world[node][:3, 3] for node in skin_joints]).astype(np.float64)
+    segments: list[tuple[int, np.ndarray, np.ndarray, float]] = []
+    for slot, node in enumerate(skin_joints):
+        for child in nodes[node].children:
+            child_slot = node_slot.get(child)
+            if child_slot is None:
+                continue
+            start = origins[slot]
+            end = origins[child_slot]
+            length = float(np.linalg.norm(end - start))
+            if length < 1e-4:
+                continue
+            segments.append((slot, start, end, length))
+    if not segments:
+        return joint_idx, weights
+
+    count = len(positions)
+    best_dist = np.full(count, np.inf)
+    best_from_end = np.full(count, np.inf)
+    best_slot = np.zeros(count, dtype=np.int32)
+    joint_radius = np.full(count, np.inf)
+    points = positions.astype(np.float64)
+    for slot, start, end, length in segments:
+        span = end - start
+        along = np.clip(((points - start) @ span) / float(span @ span), 0.0, 1.0)
+        closest = start + along[:, None] * span
+        dist = np.linalg.norm(points - closest, axis=1)
+        from_end = np.minimum(along, 1.0 - along) * length
+        nearer = dist < best_dist
+        best_dist = np.where(nearer, dist, best_dist)
+        best_from_end = np.where(nearer, from_end, best_from_end)
+        best_slot = np.where(nearer, slot, best_slot)
+        joint_radius = np.where(nearer, float(np.clip(length * 0.22, 0.012, 0.045)), joint_radius)
+
+    # 뼈대에서 3.5cm 안이고, 양쪽 관절 뭉치 밖인 정점만 고정한다.
+    snap = (best_dist < 0.035) & (best_from_end > joint_radius)
+    locked_weights = weights.copy()
+    locked_joints = joint_idx.copy()
+    locked_weights[snap] = 0.0
+    locked_weights[snap, 0] = 1.0
+    locked_joints[snap, 0] = best_slot[snap]
+    locked_joints[snap, 1:] = 0.0
+    return locked_joints.astype(np.float32), locked_weights.astype(np.float32)
+
+
 def _load_mesh(gltf: dict, blob: bytes):
     prim = gltf["meshes"][0]["primitives"][0]
     attrs = prim["attributes"]
@@ -726,28 +780,65 @@ def _perspective(fov_y: float, aspect: float, near: float, far: float) -> np.nda
     return matrix
 
 
-def _xray_plate(rgba: np.ndarray) -> np.ndarray:
-    """겹쳐 쌓인 뼈 밀도를 흐리고 입자를 더해 방사선 사진처럼 만든다."""
-    import cv2
+_PLATE_GRAIN_FRAMES = 6   # 미리 만들어 두고 돌려 쓰는 입자 노이즈 장수
+_plate_cache: dict[tuple[int, int], dict] = {}
 
-    exposure = rgba[:, :, :3].astype(np.float32)
-    sharp = cv2.GaussianBlur(exposure, (0, 0), 1.15)
-    scatter = cv2.GaussianBlur(exposure, (0, 0), 7.5)
-    plate = sharp * 0.82 + scatter * 0.48
-    plate = np.clip((plate - 12.0) * 1.28, 0, 255)
-    grain = np.random.default_rng().normal(0.0, 5.0, plate.shape[:2]).astype(np.float32)
-    plate += grain[:, :, None]
 
-    height, width = plate.shape[:2]
+def _plate_constants(height: int, width: int) -> dict:
+    """크기별로 한 번만 만드는 비네팅·배경·입자 노이즈."""
+    cached = _plate_cache.get((height, width))
+    if cached is not None:
+        return cached
     y = np.linspace(-1.0, 1.0, height, dtype=np.float32)[:, None]
     x = np.linspace(-1.0, 1.0, width, dtype=np.float32)[None, :]
     vignette = np.clip(1.0 - (x * x * 0.28 + y * y * 0.42), 0.0, 1.0)
-    background = np.empty_like(plate)
+    background = np.empty((height, width, 3), dtype=np.float32)
     background[:, :, 0] = 7.0
     background[:, :, 1] = 12.0
     background[:, :, 2] = 18.0
     background *= (0.45 + 0.55 * vignette)[:, :, None]
-    merged = np.clip(background + plate * vignette[:, :, None], 0, 255).astype(np.uint8)
+    rng = np.random.default_rng()
+    vignette3 = np.repeat(vignette[:, :, None], 3, axis=2)
+    # 결과 = 배경 + (판 + 입자) x 비네팅 = 배경 + 판 x 비네팅 + 입자 x 비네팅.
+    # 입자 x 비네팅은 미리 계산해 양수/음수 부분으로 나눠 둔다 (uint8 포화 덧셈·뺄셈으로 처리).
+    grain = []
+    for _ in range(_PLATE_GRAIN_FRAMES):
+        g = rng.normal(0.0, 5.0, (height, width, 1)).astype(np.float32) * vignette3
+        grain.append((
+            np.clip(np.rint(g), 0, 255).astype(np.uint8),
+            np.clip(np.rint(-g), 0, 255).astype(np.uint8),
+        ))
+    cached = {
+        "vignette": np.clip(np.rint(vignette3 * 255.0), 0, 255).astype(np.uint8),
+        "background": np.clip(np.rint(background), 0, 255).astype(np.uint8),
+        "grain": grain,
+        "rng": rng,
+    }
+    _plate_cache[(height, width)] = cached
+    return cached
+
+
+def _xray_plate(rgba: np.ndarray) -> np.ndarray:
+    """겹쳐 쌓인 뼈 밀도를 흐리고 입자를 더해 방사선 사진처럼 만든다.
+
+    매 프레임 도는 부분이라 OpenCV 연산 위주로 짰다. 넓은 산란 블러는 1/4 크기에서 계산하고,
+    비네팅·배경·입자 노이즈는 미리 만들어 둔다.
+    """
+    import cv2
+
+    height, width = rgba.shape[:2]
+    const = _plate_constants(height, width)
+    exposure = np.ascontiguousarray(rgba[:, :, :3])
+    sharp = cv2.GaussianBlur(exposure, (0, 0), 1.15)
+    small = cv2.resize(exposure, (max(1, width // 4), max(1, height // 4)), interpolation=cv2.INTER_AREA)
+    scatter = cv2.resize(cv2.GaussianBlur(small, (0, 0), 7.5 / 4), (width, height), interpolation=cv2.INTER_LINEAR)
+    # (sharp*0.82 + scatter*0.48 - 12) * 1.28, 0~255로 잘림 (uint8 포화 연산)
+    plate = cv2.addWeighted(sharp, 0.82 * 1.28, scatter, 0.48 * 1.28, -12.0 * 1.28)
+    merged = cv2.multiply(plate, const["vignette"], scale=1.0 / 255.0)
+    cv2.add(merged, const["background"], merged)
+    grain_up, grain_down = const["grain"][int(const["rng"].integers(len(const["grain"])))]
+    cv2.add(merged, grain_up, merged)
+    cv2.subtract(merged, grain_down, merged)
     return cv2.cvtColor(merged, cv2.COLOR_RGB2BGR)
 
 
