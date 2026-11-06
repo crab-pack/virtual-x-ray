@@ -344,6 +344,14 @@ def _visible(pose: np.ndarray, index: int) -> bool:
     return float(pose[index, 3]) >= VIS_MIN
 
 
+def seen_landmarks(pose: np.ndarray | None) -> np.ndarray | None:
+    """웹캠 화면 안에 실제로 잡힌 랜드마크만 True."""
+    if pose is None:
+        return None
+    x, y, vis = pose[:, 0], pose[:, 1], pose[:, 3]
+    return (vis >= VIS_MIN) & (x >= 0.0) & (x <= 1.0) & (y >= 0.0) & (y <= 1.0)
+
+
 def draw_connections(
     canvas: np.ndarray,
     pose: np.ndarray,
@@ -883,33 +891,85 @@ def render_avatar(
     return canvas
 
 
-def load_collimator() -> np.ndarray | None:
-    path = ROOT / "collimator_light.png"
-    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if image is None or image.ndim != 3 or image.shape[2] != 4:
-        print("collimator_light.png 를 찾지 못해 조명 오버레이를 건너뜁니다.")
+COLLIMATOR_DIM = 0.1          # 박스 바깥 밝기 (기존 PNG의 90% 검정 덮개와 같음)
+COLLIMATOR_LINE = (255, 255, 255)
+COLLIMATOR_THICK = 2
+COLLIMATOR_TAIL = 60          # 십자선이 박스 밖으로 나오는 길이(px)
+COLLIMATOR_MIN = 48           # 박스 최소 한 변(px)
+COLLIMATOR_FOLLOW = 0.35      # 박스가 목표로 따라가는 비율(프레임당)
+
+
+def capsule_visible_box(
+    points: np.ndarray,
+    seen: np.ndarray | None,
+    yaw: float,
+    pitch: float,
+    offset: tuple[float, float],
+    zoom: float,
+) -> np.ndarray | None:
+    """뼈 메시가 없을 때(캡슐 아바타) 쓰는 콜리메이터 박스 계산."""
+    ids = [i for i in range(33) if seen is None or bool(seen[i])]
+    if not ids:
         return None
-    return image
+    screen = _project(points[ids], yaw, pitch, offset, zoom)
+    front = screen[:, 2] > 0.3
+    if not np.any(front):
+        return None
+    screen = screen[front]
+    radius = np.array([0.14 if i <= 10 else 0.08 for i, f in zip(ids, front) if f], dtype=np.float32)
+    rpx = FOCAL * radius * zoom / screen[:, 2]
+    return np.array(
+        [
+            (screen[:, 0] - rpx).min(),
+            (screen[:, 1] - rpx).min(),
+            (screen[:, 0] + rpx).max(),
+            (screen[:, 1] + rpx).max(),
+        ],
+        dtype=np.float32,
+    )
 
 
-def overlay_center(base: np.ndarray, sprite: np.ndarray) -> np.ndarray:
-    """가운데에 맞추고, PNG 알파로 바탕이 비치게 합성한다."""
-    base_h, base_w = base.shape[:2]
-    sprite_h, sprite_w = sprite.shape[:2]
-    origin_x = (base_w - sprite_w) // 2
-    origin_y = (base_h - sprite_h) // 2
-    x1 = max(origin_x, 0)
-    y1 = max(origin_y, 0)
-    x2 = min(origin_x + sprite_w, base_w)
-    y2 = min(origin_y + sprite_h, base_h)
-    if x1 >= x2 or y1 >= y2:
-        return base
-    patch = sprite[y1 - origin_y : y2 - origin_y, x1 - origin_x : x2 - origin_x]
-    alpha = patch[:, :, 3:4].astype(np.float32) / 255.0
-    color = patch[:, :, :3].astype(np.float32)
-    region = base[y1:y2, x1:x2].astype(np.float32)
-    base[y1:y2, x1:x2] = np.clip(color * alpha + region * (1.0 - alpha), 0, 255).astype(np.uint8)
-    return base
+class Collimator:
+    """카메라에 보이는 부위만 밝히는 콜리메이터 조명. 박스는 부드럽게 따라간다."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.box: np.ndarray | None = None
+
+    def update(self, target: np.ndarray | None) -> None:
+        if target is None:
+            self.box = None
+            return
+        target = target.astype(np.float32).copy()
+        # 너무 작은 박스는 가운데를 기준으로 최소 크기까지 넓힌다.
+        for lo, hi in ((0, 2), (1, 3)):
+            size = target[hi] - target[lo]
+            if size < COLLIMATOR_MIN:
+                grow = (COLLIMATOR_MIN - size) * 0.5
+                target[lo] -= grow
+                target[hi] += grow
+        target[[0, 2]] = np.clip(target[[0, 2]], 0, self.width)
+        target[[1, 3]] = np.clip(target[[1, 3]], 0, self.height)
+        if self.box is None:
+            self.box = target
+        else:
+            self.box = self.box + (target - self.box) * COLLIMATOR_FOLLOW
+
+    def draw(self, frame: np.ndarray) -> np.ndarray:
+        out = cv2.convertScaleAbs(frame, alpha=COLLIMATOR_DIM)
+        if self.box is None:
+            return out
+        x1, y1, x2, y2 = (int(round(float(v))) for v in self.box)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return out
+        out[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        line = dict(color=COLLIMATOR_LINE, thickness=COLLIMATOR_THICK, lineType=cv2.LINE_AA)
+        cv2.rectangle(out, (x1, y1), (x2 - 1, y2 - 1), **line)
+        cv2.line(out, (cx, y1 - COLLIMATOR_TAIL), (cx, y2 + COLLIMATOR_TAIL), **line)
+        cv2.line(out, (x1 - COLLIMATOR_TAIL, cy), (x2 + COLLIMATOR_TAIL, cy), **line)
+        return out
 
 
 def draw_avatar_hud(
@@ -1035,7 +1095,7 @@ def run(args: argparse.Namespace) -> int:
     from avatar_mesh import load_bone_avatar
 
     bone_avatar = load_bone_avatar(ROOT / "assets" / "skeleton.glb", ROOT / "assets" / "bone_map.json")
-    collimator = load_collimator()
+    collimator = Collimator(AVATAR_W, AVATAR_H)
     font = load_font(22)
     font_small = load_font(16)
 
@@ -1107,8 +1167,20 @@ def run(args: argparse.Namespace) -> int:
 
             view = draw_hud(view, fps, len(poses), mirror, show_skeleton, font, font_small)
             avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
-            if show_collimator and collimator is not None:
-                avatar_view = overlay_center(avatar_view, collimator)
+            if show_collimator:
+                pose = primary_pose(poses)
+                # 추적 중인데 이번 프레임만 사람을 놓쳤으면 직전 박스를 유지한다.
+                # 대기 중(사람 없음)에는 기본 자세 전신을 비춘다.
+                if not live or pose is not None:
+                    seen = seen_landmarks(pose) if live else None
+                    if bone_avatar is not None:
+                        target = bone_avatar.visible_box(seen)
+                    else:
+                        target = capsule_visible_box(
+                            points, seen, avatar.yaw, avatar.pitch, (place_x, place_y), zoom
+                        )
+                    collimator.update(target)
+                avatar_view = collimator.draw(avatar_view)
             cv2.imshow(WINDOW, view)
             cv2.imshow(AVATAR_WINDOW, avatar_view)
             if not placed:

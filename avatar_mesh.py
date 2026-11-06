@@ -28,6 +28,34 @@ COMPONENT = {
 }
 TYPE_COUNT = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
 
+# 콜리메이터 박스 기준점: (본 이름, 이 중 하나라도 보이면 포함할 랜드마크, 뼈 두께 반경 m)
+_BOX_ANCHORS = (
+    ("head_end", (0, 7, 8), 0.04),
+    ("Head", (0, 7, 8), 0.11),
+    ("neck", (11, 12), 0.06),
+    ("LeftArm", (11,), 0.07),
+    ("RightArm", (12,), 0.07),
+    ("Spine", (11, 12), 0.15),
+    ("Spine01", (11, 12), 0.16),
+    ("Spine02", (23, 24), 0.15),
+    ("Hips", (23, 24), 0.17),
+    ("LeftForeArm", (13,), 0.05),
+    ("RightForeArm", (14,), 0.05),
+    ("LeftHand", (15,), 0.05),
+    ("RightHand", (16,), 0.05),
+    ("LeftUpLeg", (23,), 0.08),
+    ("RightUpLeg", (24,), 0.08),
+    ("LeftLeg", (25,), 0.07),
+    ("RightLeg", (26,), 0.07),
+    ("LeftFoot", (27,), 0.07),
+    ("RightFoot", (28,), 0.07),
+    ("LeftToeBase", (29, 31), 0.06),
+    ("RightToeBase", (30, 32), 0.06),
+)
+# 손 본은 손목에 있으므로, 아래팔 방향으로 손끝까지 연장한 점도 넣는다.
+_FINGER_TIPS = (("LeftHand", "LeftForeArm", 15), ("RightHand", "RightForeArm", 16))
+_FINGER_LEN = 0.11
+
 
 def describe_glb(path: Path) -> str:
     gltf, _blob = _read_glb(path)
@@ -150,6 +178,11 @@ class BoneAvatar:
         self.fbo = ctx.framebuffer(color_attachments=[self.color], depth_attachment=self.depth)
         self._bone_buf = np.zeros((24, 4, 4), dtype=np.float32)
         self._aim_dir: dict[int, np.ndarray] = {}
+        # 마지막 렌더 결과. 콜리메이터 박스를 화면 좌표로 계산할 때 쓴다.
+        self._last_worlds: list[np.ndarray] | None = None
+        self._last_mvp: np.ndarray | None = None
+        self._last_proj: np.ndarray | None = None
+        self._last_zoom = 1.0
 
     def render(
         self,
@@ -167,6 +200,9 @@ class BoneAvatar:
         worlds = self.bind_world if not live else self._posed_worlds(points, vis)
         self._write_bones(worlds)
         view, mvp = self._camera(yaw, pitch, offset, zoom)
+        self._last_worlds = worlds
+        self._last_mvp = mvp
+        self._last_zoom = float(zoom)
         ctx = self.ctx
         ctx.disable(ctx.DEPTH_TEST)
         ctx.enable(ctx.BLEND)
@@ -219,7 +255,59 @@ class BoneAvatar:
         view[0, 3] += float(offset[0]) * float(zoom)
         view[1, 3] += float(offset[1]) * float(zoom)
         proj = _perspective(np.deg2rad(34.0), self.width / self.height, 0.05, 30.0)
+        self._last_proj = proj
         return view, proj @ view @ self._model_matrix(zoom)
+
+    def visible_box(self, seen: np.ndarray | None) -> np.ndarray | None:
+        """마지막으로 그린 뼈 중, 카메라에 보이는 랜드마크에 해당하는 부분만 감싸는 화면 박스.
+
+        seen은 33개 랜드마크별 bool 배열이고, None이면 전신을 감싼다.
+        반환값은 (x1, y1, x2, y2) 픽셀 좌표, 감쌀 뼈가 없으면 None.
+        """
+        if self._last_worlds is None or self._last_mvp is None or self._last_proj is None:
+            return None
+        worlds = self._last_worlds
+
+        def ok(ids: tuple[int, ...]) -> bool:
+            return seen is None or any(bool(seen[i]) for i in ids)
+
+        def pos(name: str) -> np.ndarray:
+            return worlds[self.by_name[name]][:3, 3]
+
+        centers: list[np.ndarray] = []
+        radii: list[float] = []
+        for name, ids, radius in _BOX_ANCHORS:
+            if name in self.by_name and ok(ids):
+                centers.append(pos(name))
+                radii.append(radius)
+        for hand, forearm, landmark in _FINGER_TIPS:
+            if hand not in self.by_name or forearm not in self.by_name or not ok((landmark,)):
+                continue
+            direction = pos(hand) - pos(forearm)
+            length = float(np.linalg.norm(direction))
+            if length > 1e-5:
+                centers.append(pos(hand) + direction / length * _FINGER_LEN)
+                radii.append(0.04)
+        if not centers:
+            return None
+
+        homo = np.hstack([np.asarray(centers, dtype=np.float32), np.ones((len(centers), 1), dtype=np.float32)])
+        clip = homo @ self._last_mvp.T
+        w = clip[:, 3]
+        front = w > 1e-3
+        if not np.any(front):
+            return None
+        clip, w = clip[front], w[front]
+        radius = np.asarray(radii, dtype=np.float32)[front]
+        px = (clip[:, 0] / w + 1.0) * 0.5 * self.width
+        py = (1.0 - clip[:, 1] / w) * 0.5 * self.height
+        # 모델 단위 반경 → 픽셀 반경 (원근 투영의 초점 거리 사용)
+        focal_px = 0.5 * self.height * float(self._last_proj[1, 1])
+        rpx = radius * self.unit_scale * self._last_zoom * focal_px / w
+        return np.array(
+            [(px - rpx).min(), (py - rpx).min(), (px + rpx).max(), (py + rpx).max()],
+            dtype=np.float32,
+        )
 
     def _posed_worlds(self, points: np.ndarray, vis: np.ndarray) -> list[np.ndarray]:
         targets = _pose_targets(points, vis)
