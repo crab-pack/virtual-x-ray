@@ -144,6 +144,8 @@ class FingerState:
         self.baseline = {side: {f: np.full(3, np.inf) for f in FINGERS} for side in ("Left", "Right")}
         self.seen_at = {"Left": -1e9, "Right": -1e9}
         self.last_update = None
+        # 손 방향(손목→중지 뿌리)과 가로 방향(새끼 뿌리→검지 뿌리), 아바타 좌표
+        self.frames: dict[str, tuple[np.ndarray, np.ndarray] | None] = {"Left": None, "Right": None}
 
     def update(self, matched: dict[str, HandObservation], now: float) -> None:
         dt = 0.0 if self.last_update is None else max(0.0, now - self.last_update)
@@ -156,6 +158,7 @@ class FingerState:
                         self.angles[side][f] *= RELAX
                 continue
             self.seen_at[side] = now
+            self._update_frame(side, hand.world)
             raw = flex_angles(hand.world)
             for f in FINGERS:
                 base = self.baseline[side][f]
@@ -164,6 +167,31 @@ class FingerState:
                 self.baseline[side][f] = base
                 target = np.clip(raw[f] - base, 0.0, MAX_FLEX)
                 self.angles[side][f] = self.angles[side][f] * (1.0 - FOLLOW) + target * FOLLOW
+
+    def _update_frame(self, side: str, world: np.ndarray) -> None:
+        # MediaPipe 좌표(x 오른쪽, y 아래, z 카메라 반대쪽)를 아바타 좌표(x 오른쪽, y 위, z 카메라 쪽)로
+        flip = np.array([1.0, -1.0, -1.0])
+        direction = (world[9] - world[0]).astype(np.float64) * flip
+        across = (world[5] - world[17]).astype(np.float64) * flip
+        if np.linalg.norm(direction) < 1e-6 or np.linalg.norm(across) < 1e-6:
+            return
+        direction /= np.linalg.norm(direction)
+        across /= np.linalg.norm(across)
+        prev = self.frames[side]
+        if prev is not None:
+            direction = prev[0] * (1.0 - FOLLOW) + direction * FOLLOW
+            across = prev[1] * (1.0 - FOLLOW) + across * FOLLOW
+            direction /= max(np.linalg.norm(direction), 1e-6)
+            across /= max(np.linalg.norm(across), 1e-6)
+        self.frames[side] = (direction, across)
+
+    def hand_frames(self, now: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """최근에 본 손의 방향만 돌려준다. 오래 놓친 손은 자세 인식 기준(기존 방식)으로 돌아간다."""
+        return {
+            side: frame
+            for side, frame in self.frames.items()
+            if frame is not None and now - self.seen_at[side] <= HOLD_SECONDS
+        }
 
     def curls(self) -> dict[str, np.ndarray]:
         """아바타 본 이름 접두어("LeftHandIndex") -> 세 마디 각도."""

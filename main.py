@@ -1274,6 +1274,7 @@ def run(args: argparse.Namespace) -> int:
                 avatar_view = bone_avatar.render(
                     points, vis, avatar.yaw, avatar.pitch, live, STAGE, (place_x, place_y), zoom,
                     curls=fingers.curls() if hands_on else None,
+                    hand_frames=fingers.hand_frames(now) if hands_on else None,
                 )
             else:
                 avatar_view = render_avatar(

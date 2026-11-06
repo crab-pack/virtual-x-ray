@@ -15,6 +15,9 @@ import numpy as np
 # main.py의 "virtual_xray" 로거 아래에 두어 같은 출력 형식과 레벨을 따른다.
 log = logging.getLogger("virtual_xray.avatar")
 
+# 손목이 아래팔 방향에서 꺾일 수 있는 최대 각도 (손 인식이 튀어도 손이 뒤집히지 않게)
+_WRIST_LIMIT = float(np.deg2rad(80.0))
+
 # 골반부터 머리까지는 카메라 앞뒤(z)로 숙이지 않고 수직을 유지한다.
 _UPRIGHT_BONES = {"Hips", "Spine02", "Spine01", "Spine", "neck", "Head"}
 
@@ -85,6 +88,7 @@ class BoneAvatar:
         self.hip_pos = hips[:3, 3].copy()
         self._check_aims()
         self.finger_axes = self._finger_axes()
+        self.hand_rest = self._hand_rest()
 
         self.ctx = moderngl.create_context(standalone=True)
         self._init_gl()
@@ -111,6 +115,17 @@ class BoneAvatar:
                 continue
             local = np.linalg.inv(bind[:3, :3]) @ (axis / np.linalg.norm(axis))
             out[name] = (index, (local / np.linalg.norm(local)).astype(np.float32))
+        return out
+
+    def _hand_rest(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """바인드 자세의 손 방향(손목→중지 뿌리)과 가로 방향(새끼 뿌리→검지 뿌리)."""
+        out = {}
+        for side in ("Left", "Right"):
+            names = [f"{side}Hand", f"{side}HandMiddle1", f"{side}HandIndex1", f"{side}HandPinky1"]
+            if not all(n in self.by_name for n in names):
+                continue
+            hand, middle, index, pinky = (self.bind_world[self.by_name[n]][:3, 3] for n in names)
+            out[side] = ((middle - hand).astype(np.float32), (index - pinky).astype(np.float32))
         return out
 
     def _check_aims(self) -> None:
@@ -192,11 +207,14 @@ class BoneAvatar:
         offset: tuple[float, float] = (0.0, 0.0),
         zoom: float = 1.0,
         curls: dict[str, np.ndarray] | None = None,
+        hand_frames: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> np.ndarray:
-        """curls: 손가락 굽힘 각도 {"LeftHandIndex": [마디1, 마디2, 마디3] 라디안}. 추적 중일 때만 쓴다."""
+        """curls: 손가락 굽힘 각도 {"LeftHandIndex": [마디1, 마디2, 마디3] 라디안}.
+        hand_frames: 손 방향 {"Left": (손목→중지 뿌리, 새끼 뿌리→검지 뿌리)} 아바타 좌표.
+        둘 다 추적 중일 때만 쓴다."""
         if not live:
             self._aim_dir.clear()
-        worlds = self.bind_world if not live else self._posed_worlds(points, vis, curls)
+        worlds = self.bind_world if not live else self._posed_worlds(points, vis, curls, hand_frames)
         self._write_bones(worlds)
         view, mvp = self._camera(yaw, pitch, offset, zoom)
         ctx = self.ctx
@@ -258,6 +276,7 @@ class BoneAvatar:
         points: np.ndarray,
         vis: np.ndarray,
         curls: dict[str, np.ndarray] | None = None,
+        hand_frames: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> list[np.ndarray]:
         targets = _pose_targets(points, vis)
         rotations: dict[int, np.ndarray] = {}
@@ -288,6 +307,21 @@ class BoneAvatar:
             for name in _UPRIGHT_BONES:
                 joint = self.by_name[name]
                 rotations[joint] = torso @ self.bind_world[joint][:3, :3]
+        # 손 인식이 있으면 손목 방향과 손바닥 방향(비틀림)까지 손 모델 기준으로 맞춘다.
+        for side, (direction, across) in (hand_frames or {}).items():
+            hand_name, fore_name = f"{side}Hand", f"{side}ForeArm"
+            if side not in self.hand_rest or hand_name not in targets or fore_name not in targets:
+                continue
+            fore = targets[hand_name] - targets[fore_name]
+            if float(np.linalg.norm(fore)) < 1e-5 or float(np.linalg.norm(direction)) < 1e-5:
+                continue
+            fore = fore / np.linalg.norm(fore)
+            direction = _step_toward(fore.astype(np.float32), (direction / np.linalg.norm(direction)).astype(np.float32), _WRIST_LIMIT)
+            rest_dir, rest_across = self.hand_rest[side]
+            turn = _align_frames(rest_dir, rest_across, direction, across)
+            if turn is not None:
+                joint = self.by_name[hand_name]
+                rotations[joint] = turn @ self.bind_world[joint][:3, :3]
 
         worlds: list[np.ndarray | None] = [None] * len(self.nodes)
 
@@ -577,6 +611,30 @@ def _quat_to_mat(q: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+
+def _align_frames(
+    rest_dir: np.ndarray, rest_across: np.ndarray, direction: np.ndarray, across: np.ndarray
+) -> np.ndarray | None:
+    """(방향, 가로) 두 벡터로 정한 바인드 자세 좌표계를 목표 좌표계로 돌리는 회전."""
+
+    def basis(d: np.ndarray, a: np.ndarray) -> np.ndarray | None:
+        d = np.asarray(d, dtype=np.float64)
+        a = np.asarray(a, dtype=np.float64)
+        if np.linalg.norm(d) < 1e-6:
+            return None
+        e1 = d / np.linalg.norm(d)
+        a = a - (a @ e1) * e1
+        if np.linalg.norm(a) < 1e-6:
+            return None
+        e2 = a / np.linalg.norm(a)
+        return np.stack([e1, e2, np.cross(e1, e2)], axis=1)
+
+    rest = basis(rest_dir, rest_across)
+    target = basis(direction, across)
+    if rest is None or target is None:
+        return None
+    return (target @ rest.T).astype(np.float32)
 
 
 def _step_toward(src: np.ndarray, dst: np.ndarray, max_angle: float) -> np.ndarray:
