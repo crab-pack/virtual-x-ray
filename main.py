@@ -88,12 +88,16 @@ INFER_WIDTH = 640
 
 def download_model(name: str) -> Path:
     filename, url = MODELS[name]
+    return download_file(filename, url, f"포즈 모델({name})")
+
+
+def download_file(filename: str, url: str, label: str) -> Path:
     dest = MODEL_DIR / filename
     if dest.exists() and dest.stat().st_size > 1_000_000:
         return dest
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".part")
-    log.info("포즈 모델을 받는 중입니다 (%s).", name)
+    log.info("%s을 받는 중입니다.", label)
     next_step = [25]
 
     def hook(count: int, block: int, total: int) -> None:
@@ -1121,7 +1125,7 @@ def draw_hud(
     tracking = "추가기능 골격 표시 중" if skeleton_on else "라인 골격 표시 중"
     draw.text((32, 92), tracking, font=font_small, fill=(186, 214, 230, 255))
 
-    help_text = "Q 종료    M 반전    V 추가기능    B 디버그    S 저장"
+    help_text = "Q 종료    M 반전    V 추가기능    H 손가락    B 디버그    S 저장"
     box = draw.textbbox((0, 0), help_text, font=font_small)
     text_w = box[2] - box[0]
     bar_x = max(16, (width - text_w) // 2 - 18)
@@ -1156,7 +1160,30 @@ def self_test(model_name: str) -> int:
         landmarker.close()
     count = len(result.pose_landmarks or [])
     log.info("self-test ok  model=%s  poses=%d", model_path.name, count)
+
+    from hand_tracking import HAND_MODEL, HandTracker
+
+    hand_path = download_file(*HAND_MODEL, "손 모델")
+    tracker = HandTracker(hand_path)
+    try:
+        hands = tracker.detect(image, 0)
+    finally:
+        tracker.close()
+    log.info("self-test ok  model=%s  hands=%d", hand_path.name, len(hands))
     return 0
+
+
+def open_hand_tracker():
+    """손 인식기를 연다. 실패하면 경고만 남기고 None (손가락 연동 없이 계속 실행)."""
+    from hand_tracking import HAND_MODEL, HandTracker
+
+    try:
+        tracker = HandTracker(download_file(*HAND_MODEL, "손 모델"))
+    except (Exception, SystemExit) as exc:
+        log.warning("손 인식기를 열지 못해 손가락 연동 없이 실행합니다: %s", exc)
+        return None
+    log.info("손 인식기를 열었습니다. H 키로 손가락 연동을 켜고 끕니다.")
+    return tracker
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1172,6 +1199,12 @@ def run(args: argparse.Namespace) -> int:
     collimator = load_collimator()
     font = load_font(22)
     font_small = load_font(16)
+    from hand_tracking import FingerState, draw_hands, match_hands
+
+    hands_on = not args.no_hands
+    hand_tracker = open_hand_tracker() if hands_on else None
+    hands_on = hand_tracker is not None
+    fingers = FingerState()
 
     mirror = not args.no_mirror
     show_collimator = True
@@ -1223,15 +1256,24 @@ def run(args: argparse.Namespace) -> int:
             points, vis, live, scale = avatar.current(now)
             place_x, place_y, zoom = avatar.placement(live)
 
+            hands, matched = [], {}
+            if hands_on and hand_tracker is not None:
+                hands = hand_tracker.detect(image, stamp)
+                matched = match_hands(hands, primary_pose(poses))
+            fingers.update(matched, now)
+
             view = frame
             if poses:
                 if show_skeleton:
                     view = render_poses(frame, poses, detailed_face, glow, xray)
                 else:
                     view = render_line_skeleton(frame, poses)
+            if hands:
+                draw_hands(view, hands, matched)
             if bone_avatar is not None:
                 avatar_view = bone_avatar.render(
-                    points, vis, avatar.yaw, avatar.pitch, live, STAGE, (place_x, place_y), zoom
+                    points, vis, avatar.yaw, avatar.pitch, live, STAGE, (place_x, place_y), zoom,
+                    curls=fingers.curls() if hands_on else None,
                 )
             else:
                 avatar_view = render_avatar(
@@ -1251,6 +1293,8 @@ def run(args: argparse.Namespace) -> int:
                     view = draw_seen_debug(view, raw, smooth, presence, seen, font_small)
                     if now - debug_logged >= 1.0:
                         log.debug(diag_log_line(raw, smooth, presence, seen))
+                        if hands_on:
+                            log.debug("손가락(도) 손 %d개 인식, 짝 %s | %s", len(hands), sorted(matched), fingers.summary())
                         debug_logged = now
             view = draw_hud(view, fps, len(poses), mirror, show_skeleton, font, font_small)
             avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
@@ -1280,6 +1324,11 @@ def run(args: argparse.Namespace) -> int:
                 glow = not glow
             elif key in (ord("f"), ord("F")):
                 detailed_face = not detailed_face
+            elif key in (ord("h"), ord("H")):
+                if hand_tracker is None:
+                    hand_tracker = open_hand_tracker()
+                hands_on = hand_tracker is not None and not hands_on
+                log.info("손가락 연동 %s", "켜짐" if hands_on else "꺼짐")
             elif key in (ord("b"), ord("B")):
                 debug_mode = not debug_mode
                 # 디버그 중에는 콘솔 출력 레벨을 DEBUG로 낮추고, 끄면 INFO로 되돌린다.
@@ -1320,6 +1369,8 @@ def run(args: argparse.Namespace) -> int:
     finally:
         camera.close()
         landmarker.close()
+        if hand_tracker is not None:
+            hand_tracker.close()
         cv2.destroyAllWindows()
     return 0
 
@@ -1334,6 +1385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-mirror", action="store_true", help="좌우 반전 없이 카메라 원본을 봅니다")
     parser.add_argument("--self-test", action="store_true", help="모델 로드와 빈 프레임 추론만 확인합니다")
     parser.add_argument("--inspect-glb", action="store_true", help="뼈 메시의 본 이름과 크기를 출력합니다")
+    parser.add_argument("--no-hands", action="store_true", help="손가락 연동(손 인식) 없이 시작합니다. 실행 중 H 키로 켤 수 있습니다")
     args = parser.parse_args()
     args.poses = min(4, max(1, args.poses))
     return args

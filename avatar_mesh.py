@@ -84,10 +84,34 @@ class BoneAvatar:
         hips = self.bind_world[self.by_name["Hips"]]
         self.hip_pos = hips[:3, 3].copy()
         self._check_aims()
+        self.finger_axes = self._finger_axes()
 
         self.ctx = moderngl.create_context(standalone=True)
         self._init_gl()
         log.info("뼈 메시를 불러왔습니다. 삼각형 %d, 본 %d.", len(self.indices) // 3, len(self.skin_joints))
+
+    def _finger_axes(self) -> dict[str, tuple[int, np.ndarray]]:
+        """손가락 마디 본마다 굽힘 축(본 로컬 좌표). 손가락 본이 없는 모델이면 빈 dict.
+
+        바인드 자세에서 손바닥은 정면(+z)을 향하므로, 굽힘 축은 '마디 방향 x 정면'이다.
+        키는 "LeftHandIndex2" 같은 본 이름, 값은 (노드 번호, 로컬 축).
+        """
+        out: dict[str, tuple[int, np.ndarray]] = {}
+        palm = np.array([0.0, 0.0, 1.0])
+        for name, index in self.by_name.items():
+            if not name or name[-1] not in "123" or "Hand" not in name:
+                continue
+            nxt = self.by_name.get(name[:-1] + str(int(name[-1]) + 1))
+            if nxt is None:
+                continue
+            bind = self.bind_world[index]
+            direction = self.bind_world[nxt][:3, 3] - bind[:3, 3]
+            axis = np.cross(direction, palm)
+            if float(np.linalg.norm(axis)) < 1e-6:
+                continue
+            local = np.linalg.inv(bind[:3, :3]) @ (axis / np.linalg.norm(axis))
+            out[name] = (index, (local / np.linalg.norm(local)).astype(np.float32))
+        return out
 
     def _check_aims(self) -> None:
         for bone, child in self.aims:
@@ -167,10 +191,12 @@ class BoneAvatar:
         background: np.ndarray,
         offset: tuple[float, float] = (0.0, 0.0),
         zoom: float = 1.0,
+        curls: dict[str, np.ndarray] | None = None,
     ) -> np.ndarray:
+        """curls: 손가락 굽힘 각도 {"LeftHandIndex": [마디1, 마디2, 마디3] 라디안}. 추적 중일 때만 쓴다."""
         if not live:
             self._aim_dir.clear()
-        worlds = self.bind_world if not live else self._posed_worlds(points, vis)
+        worlds = self.bind_world if not live else self._posed_worlds(points, vis, curls)
         self._write_bones(worlds)
         view, mvp = self._camera(yaw, pitch, offset, zoom)
         ctx = self.ctx
@@ -227,9 +253,21 @@ class BoneAvatar:
         proj = _perspective(np.deg2rad(34.0), self.width / self.height, 0.05, 30.0)
         return view, proj @ view @ self._model_matrix(zoom)
 
-    def _posed_worlds(self, points: np.ndarray, vis: np.ndarray) -> list[np.ndarray]:
+    def _posed_worlds(
+        self,
+        points: np.ndarray,
+        vis: np.ndarray,
+        curls: dict[str, np.ndarray] | None = None,
+    ) -> list[np.ndarray]:
         targets = _pose_targets(points, vis)
         rotations: dict[int, np.ndarray] = {}
+        # 손가락 굽힘: 노드 번호 -> 로컬 회전 (부모 기준)
+        flex: dict[int, np.ndarray] = {}
+        for prefix, angles in (curls or {}).items():
+            for k in range(3):
+                entry = self.finger_axes.get(f"{prefix}{k + 1}")
+                if entry is not None and abs(float(angles[k])) > 1e-4:
+                    flex[entry[0]] = _axis_angle(entry[1], float(angles[k]))
         torso = self._torso_delta(targets)
         for bone, child in self.aims:
             if bone in _UPRIGHT_BONES or bone not in targets or child not in targets:
@@ -266,6 +304,8 @@ class BoneAvatar:
                 rot = self.bind_world[index][:3, :3]
             else:
                 rot = parent[:3, :3] @ node.local_r
+            if index in flex:
+                rot = rot @ flex[index]
             matrix = np.eye(4, dtype=np.float32)
             matrix[:3, :3] = rot
             matrix[:3, 3] = pos
