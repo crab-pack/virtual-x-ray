@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import threading
@@ -953,33 +954,136 @@ def render_avatar(
     return canvas
 
 
-def load_collimator() -> np.ndarray | None:
-    path = ROOT / "collimator_light.png"
-    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if image is None or image.ndim != 3 or image.shape[2] != 4:
-        log.warning("collimator_light.png 를 찾지 못해 조명 오버레이를 건너뜁니다.")
-        return None
-    return image
+COLLIMATOR_FILE = ROOT / "collimator.json"   # 맞춘 박스 위치 (기기마다 다르므로 git에 넣지 않음)
+COLLIMATOR_DEFAULT = (173, 343, 589, 759)     # 기존 collimator_light.png의 투명한 구멍과 같은 위치
+COLLIMATOR_DIM = 0.1           # 박스 바깥 밝기 (기존 PNG의 90% 검정 덮개와 같음)
+COLLIMATOR_LINE = (255, 255, 255)
+COLLIMATOR_THICK = 2
+COLLIMATOR_TAIL = 60           # 십자선이 박스 밖으로 나오는 길이(px)
+COLLIMATOR_MIN = 32            # 박스 최소 한 변(px)
+COLLIMATOR_HANDLE = 22         # 꼭짓점을 잡을 수 있는 거리(px)
+COLLIMATOR_EDIT_COLOR = (80, 200, 255)
 
 
-def overlay_center(base: np.ndarray, sprite: np.ndarray) -> np.ndarray:
-    """가운데에 맞추고, PNG 알파로 바탕이 비치게 합성한다."""
-    base_h, base_w = base.shape[:2]
-    sprite_h, sprite_w = sprite.shape[:2]
-    origin_x = (base_w - sprite_w) // 2
-    origin_y = (base_h - sprite_h) // 2
-    x1 = max(origin_x, 0)
-    y1 = max(origin_y, 0)
-    x2 = min(origin_x + sprite_w, base_w)
-    y2 = min(origin_y + sprite_h, base_h)
-    if x1 >= x2 or y1 >= y2:
-        return base
-    patch = sprite[y1 - origin_y : y2 - origin_y, x1 - origin_x : x2 - origin_x]
-    alpha = patch[:, :, 3:4].astype(np.float32) / 255.0
-    color = patch[:, :, :3].astype(np.float32)
-    region = base[y1:y2, x1:x2].astype(np.float32)
-    base[y1:y2, x1:x2] = np.clip(color * alpha + region * (1.0 - alpha), 0, 255).astype(np.uint8)
-    return base
+class Collimator:
+    """아바타 화면에 고정된 콜리메이터 조명. 편집 모드에서 꼭짓점을 드래그해 영역을 맞춘다.
+
+    박스는 아바타 화면(이미지) 픽셀 좌표로 저장한다. 창 크기나 몸 위치와 상관없이 그대로 유지된다.
+    """
+
+    def __init__(self, width: int, height: int, path: Path = COLLIMATOR_FILE) -> None:
+        self.width = width
+        self.height = height
+        self.path = path
+        self.box = list(COLLIMATOR_DEFAULT)
+        self.editing = False
+        self._drag: tuple[str, int, int, list[int]] | None = None  # (종류, 시작 x, 시작 y, 시작 박스)
+        self._load()
+
+    # ---- 저장
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            box = [int(v) for v in data["box"]]
+            if len(box) == 4:
+                self.box = self._clamped(box)
+                log.info("콜리메이터 위치를 불러왔습니다: %s", self.box)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.warning("콜리메이터 설정을 읽지 못해 기본 위치를 씁니다 (%s): %s", self.path.name, exc)
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps({"box": self.box}, indent=1), encoding="utf-8")
+            log.info("콜리메이터 위치를 저장했습니다: %s", self.box)
+        except OSError as exc:
+            log.warning("콜리메이터 위치를 저장하지 못했습니다: %s", exc)
+
+    def toggle_edit(self) -> None:
+        """편집 모드 전환. 편집을 끝내면(고정하면) 위치를 저장한다."""
+        self.editing = not self.editing
+        self._drag = None
+        if self.editing:
+            log.info("콜리메이터 편집: 꼭짓점을 드래그해 크기를, 안쪽을 드래그해 위치를 맞춘 뒤 L로 고정하세요.")
+        else:
+            self._save()
+
+    # ---- 마우스
+    def _clamped(self, box: list[int]) -> list[int]:
+        x1, y1, x2, y2 = box
+        x1, x2 = sorted((int(np.clip(x1, 0, self.width)), int(np.clip(x2, 0, self.width))))
+        y1, y2 = sorted((int(np.clip(y1, 0, self.height)), int(np.clip(y2, 0, self.height))))
+        if x2 - x1 < COLLIMATOR_MIN:
+            x2 = min(self.width, x1 + COLLIMATOR_MIN)
+            x1 = x2 - COLLIMATOR_MIN
+        if y2 - y1 < COLLIMATOR_MIN:
+            y2 = min(self.height, y1 + COLLIMATOR_MIN)
+            y1 = y2 - COLLIMATOR_MIN
+        return [x1, y1, x2, y2]
+
+    def _corners(self) -> list[tuple[int, int]]:
+        x1, y1, x2, y2 = self.box
+        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+    def on_mouse(self, event: int, x: int, y: int, _flags: int, _param) -> None:
+        """cv2.setMouseCallback용. 편집 모드가 아니면 아무것도 바꾸지 않는다."""
+        if not self.editing:
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            dist = [np.hypot(x - cx, y - cy) for cx, cy in self._corners()]
+            nearest = int(np.argmin(dist))
+            x1, y1, x2, y2 = self.box
+            if dist[nearest] <= COLLIMATOR_HANDLE:
+                self._drag = ("corner", nearest, 0, list(self.box))
+            elif x1 <= x <= x2 and y1 <= y <= y2:
+                self._drag = ("move", x, y, list(self.box))
+        elif event == cv2.EVENT_MOUSEMOVE and self._drag is not None:
+            kind, a, b, start = self._drag
+            if kind == "corner":
+                box = list(start)
+                box[0 if a in (0, 3) else 2] = x   # 왼쪽 꼭짓점이면 x1, 오른쪽이면 x2
+                box[1 if a in (0, 1) else 3] = y   # 위쪽 꼭짓점이면 y1, 아래쪽이면 y2
+                self.box = self._clamped(box)
+            else:
+                w, h = start[2] - start[0], start[3] - start[1]
+                nx = int(np.clip(start[0] + x - a, 0, self.width - w))
+                ny = int(np.clip(start[1] + y - b, 0, self.height - h))
+                self.box = [nx, ny, nx + w, ny + h]
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._drag = None
+
+    # ---- 그리기
+    def draw(self, frame: np.ndarray) -> np.ndarray:
+        out = cv2.convertScaleAbs(frame, alpha=COLLIMATOR_DIM)
+        x1, y1, x2, y2 = self.box
+        out[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        line = dict(color=COLLIMATOR_LINE, thickness=COLLIMATOR_THICK, lineType=cv2.LINE_AA)
+        cv2.rectangle(out, (x1, y1), (x2 - 1, y2 - 1), **line)
+        cv2.line(out, (cx, y1 - COLLIMATOR_TAIL), (cx, y2 + COLLIMATOR_TAIL), **line)
+        cv2.line(out, (x1 - COLLIMATOR_TAIL, cy), (x2 + COLLIMATOR_TAIL, cy), **line)
+        if self.editing:
+            for px, py in self._corners():
+                cv2.rectangle(out, (px - 7, py - 7), (px + 7, py + 7), COLLIMATOR_EDIT_COLOR, -1, cv2.LINE_AA)
+                cv2.rectangle(out, (px - 7, py - 7), (px + 7, py + 7), (0, 0, 0), 1, cv2.LINE_AA)
+        return out
+
+
+def draw_collimator_hint(frame: np.ndarray, font_small: ImageFont.ImageFont) -> np.ndarray:
+    """편집 모드 안내 문구 (콜리메이터 덮개 위에 그려서 어둡게 가려지지 않게)."""
+    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    message = "콜리메이터 편집 중 · 꼭짓점 드래그: 크기 · 안쪽 드래그: 위치 · L: 고정"
+    box = draw.textbbox((0, 0), message, font=font_small)
+    text_w = box[2] - box[0]
+    x = max(16, (image.size[0] - text_w) // 2)
+    y = 118
+    draw.rounded_rectangle((x - 16, y - 8, x + text_w + 16, y + 28), radius=12, fill=(10, 60, 90, 220))
+    draw.text((x, y), message, font=font_small, fill=(236, 248, 255, 255))
+    merged = Image.alpha_composite(image, overlay).convert("RGB")
+    return cv2.cvtColor(np.array(merged), cv2.COLOR_RGB2BGR)
 
 
 def draw_avatar_hud(
@@ -997,7 +1101,7 @@ def draw_avatar_hud(
     status = "추적 중" if live else "대기"
     draw.text((32, 60), status, font=font_small, fill=(186, 214, 230, 255))
 
-    help_text = "방향키 위치    + - 확대    A D 회전    C 조명    R 초기화"
+    help_text = "방향키 위치    + - 확대    A D 회전    C 조명    L 조명 맞추기    R 초기화"
     box = draw.textbbox((0, 0), help_text, font=font_small)
     text_w = box[2] - box[0]
     bar_x = max(16, (width - text_w) // 2 - 18)
@@ -1244,7 +1348,7 @@ def run(args: argparse.Namespace) -> int:
     from avatar_mesh import load_bone_avatar
 
     bone_avatar = load_bone_avatar(bone_map=ROOT / "assets" / "bone_map.json")
-    collimator = load_collimator()
+    collimator = Collimator(AVATAR_W, AVATAR_H)
     font = load_font(22)
     font_small = load_font(16)
     from hand_tracking import FingerState, draw_hands, match_hands
@@ -1272,6 +1376,8 @@ def run(args: argparse.Namespace) -> int:
     cv2.namedWindow(AVATAR_WINDOW, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW, 800, 450)
     cv2.resizeWindow(AVATAR_WINDOW, 480, 700)
+    # 마우스 좌표는 창 크기와 상관없이 아바타 화면(이미지) 픽셀 좌표로 들어온다
+    cv2.setMouseCallback(AVATAR_WINDOW, collimator.on_mouse)
     log.info("카메라 창과 뼈 아바타 창을 열었습니다. Q 또는 Esc 로 종료합니다.")
 
     try:
@@ -1347,8 +1453,10 @@ def run(args: argparse.Namespace) -> int:
                         debug_logged = now
             view = draw_hud(view, fps, len(poses), mirror, show_skeleton, font, font_small)
             avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
-            if show_collimator and collimator is not None:
-                avatar_view = overlay_center(avatar_view, collimator)
+            if show_collimator or collimator.editing:
+                avatar_view = collimator.draw(avatar_view)
+            if collimator.editing:
+                avatar_view = draw_collimator_hint(avatar_view, font_small)
             cv2.imshow(WINDOW, view)
             cv2.imshow(AVATAR_WINDOW, avatar_view)
             if not placed:
@@ -1361,6 +1469,8 @@ def run(args: argparse.Namespace) -> int:
                 pass
             elif key in (ord("q"), ord("Q"), 27):
                 break
+            elif key in (ord("l"), ord("L")):
+                collimator.toggle_edit()
             elif key in (ord("c"), ord("C")):
                 show_collimator = not show_collimator
             elif key in (ord("m"), ord("M")):
@@ -1420,6 +1530,8 @@ def run(args: argparse.Namespace) -> int:
         landmarker.close()
         if hand_tracker is not None:
             hand_tracker.close()
+        if collimator.editing:  # 편집 중에 종료하면 그때까지 맞춘 위치를 저장
+            collimator.toggle_edit()
         cv2.destroyAllWindows()
     return 0
 
