@@ -1168,7 +1168,7 @@ def run(args: argparse.Namespace) -> int:
     avatar = AvatarState()
     from avatar_mesh import load_bone_avatar
 
-    bone_avatar = load_bone_avatar(ROOT / "assets" / "skeleton.glb", ROOT / "assets" / "bone_map.json")
+    bone_avatar = load_bone_avatar(bone_map=ROOT / "assets" / "bone_map.json")
     collimator = load_collimator()
     font = load_font(22)
     font_small = load_font(16)
@@ -1351,9 +1351,9 @@ def main() -> int:
     setup_logging()
     args = parse_args()
     if args.inspect_glb:
-        from avatar_mesh import describe_glb
+        from avatar_mesh import DEFAULT_GLB, describe_glb
 
-        log.info("%s", describe_glb(ROOT / "assets" / "skeleton.glb"))
+        log.info("%s", describe_glb(DEFAULT_GLB))
         return 0
     if args.self_test:
         return self_test(args.model)

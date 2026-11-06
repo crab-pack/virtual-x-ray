@@ -19,7 +19,10 @@ log = logging.getLogger("virtual_xray.avatar")
 _UPRIGHT_BONES = {"Hips", "Spine02", "Spine01", "Spine", "neck", "Head"}
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_GLB = ROOT / "assets" / "skeleton.glb"
+BASE_GLB = ROOT / "assets" / "skeleton.glb"
+# 손가락 본을 추가한 버전 (tools/add_finger_bones.py로 생성). 있으면 이것을 쓴다.
+FINGER_GLB = ROOT / "assets" / "skeleton_fingers.glb"
+DEFAULT_GLB = FINGER_GLB if FINGER_GLB.exists() else BASE_GLB
 DEFAULT_MAP = ROOT / "assets" / "bone_map.json"
 
 COMPONENT = {
@@ -100,7 +103,7 @@ class BoneAvatar:
             uniform mat4 u_mvp;
             uniform mat4 u_model;
             uniform mat4 u_view;
-            uniform mat4 u_bones[24];
+            uniform mat4 u_bones[BONE_COUNT];
             in vec3 in_pos;
             in vec3 in_nrm;
             in vec4 in_joints;
@@ -132,6 +135,8 @@ class BoneAvatar:
                 frag = vec4(tint * density, 1.0);
             }
         """
+        bone_count = len(self.skin_joints)
+        vertex = vertex.replace("BONE_COUNT", str(bone_count))
         self.program = ctx.program(vertex_shader=vertex, fragment_shader=fragment)
         packed = np.hstack(
             [
@@ -149,7 +154,7 @@ class BoneAvatar:
         self.color = ctx.texture((self.width, self.height), 4)
         self.depth = ctx.depth_renderbuffer((self.width, self.height))
         self.fbo = ctx.framebuffer(color_attachments=[self.color], depth_attachment=self.depth)
-        self._bone_buf = np.zeros((24, 4, 4), dtype=np.float32)
+        self._bone_buf = np.zeros((bone_count, 4, 4), dtype=np.float32)
         self._aim_dir: dict[int, np.ndarray] = {}
 
     def render(
