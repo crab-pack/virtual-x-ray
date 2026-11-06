@@ -4,3 +4,4 @@ models/
 screenshots/
 *.part
 .idea/
+collimator.json
