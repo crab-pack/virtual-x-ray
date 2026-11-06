@@ -88,12 +88,16 @@ INFER_WIDTH = 640
 
 def download_model(name: str) -> Path:
     filename, url = MODELS[name]
+    return download_file(filename, url, f"포즈 모델({name})")
+
+
+def download_file(filename: str, url: str, label: str) -> Path:
     dest = MODEL_DIR / filename
     if dest.exists() and dest.stat().st_size > 1_000_000:
         return dest
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".part")
-    log.info("포즈 모델을 받는 중입니다 (%s).", name)
+    log.info("%s을 받는 중입니다.", label)
     next_step = [25]
 
     def hook(count: int, block: int, total: int) -> None:
@@ -535,6 +539,13 @@ def rest_avatar() -> tuple[np.ndarray, np.ndarray]:
 REST_POINTS, REST_VIS = rest_avatar()
 
 
+# 뼈 메시의 팔 길이 비율 (어깨 관절 사이 거리 0.304m 기준: 위팔 0.286m, 아래팔 0.276~0.282m)
+UPPER_ARM_RATIO = 0.94
+FOREARM_RATIO = 0.92
+# 어깨 기준 손목·팔꿈치 깊이(앞뒤) 허용 범위 (뒤쪽, 앞쪽). MediaPipe 깊이는 크기가 부정확해서 자른다.
+ARM_DEPTH_RANGE = (0.12, 0.35)
+
+
 def _arms_from_image(view: np.ndarray, pose: np.ndarray, aspect: float) -> np.ndarray:
     """팔의 화면상 위치는 웹캠 골격을 따른다.
 
@@ -556,13 +567,54 @@ def _arms_from_image(view: np.ndarray, pose: np.ndarray, aspect: float) -> np.nd
             continue
         out[index, 0] = rel[index, 0]
         out[index, 1] = rel[index, 1]
-    for shoulder, chain in ((11, (13, 15, 17, 19, 21)), (12, (14, 16, 18, 20, 22))):
+    for shoulder, elbow, wrist, hand in ((11, 13, 15, (17, 19, 21)), (12, 14, 16, (18, 20, 22))):
         base = float(np.clip(out[shoulder, 2], -0.2, 0.2))
         out[shoulder, 2] = base
-        for joint in chain:
-            depth = float(out[joint, 2] - out[shoulder, 2])
-            out[joint, 2] = base + float(np.clip(depth, -0.12, 0.42))
+        if min(float(pose[i, 3]) for i in (shoulder, elbow, wrist)) < 0.2:
+            for joint in (elbow, wrist) + hand:
+                depth = float(view[joint, 2] - view[shoulder, 2])
+                out[joint, 2] = base + float(np.clip(depth, -0.12, 0.42))
+            continue
+        # 손목 위치를 목표로 두고, 아바타 자신의 팔 길이로 팔꿈치 위치를 푼다(2본 IK).
+        # 사람과 아바타의 팔 비율이 달라도 손이 화면 속 손목 자리(예: 얼굴 앞)에 닿는다.
+        def depth_of(joint: int) -> float:
+            return base + float(np.clip(view[joint, 2] - view[shoulder, 2], -ARM_DEPTH_RANGE[0], ARM_DEPTH_RANGE[1]))
+
+        old_wrist = out[wrist].copy()
+        target = np.array([out[wrist, 0], out[wrist, 1], depth_of(wrist)], dtype=np.float32)
+        pole = np.array([out[elbow, 0], out[elbow, 1], depth_of(elbow)], dtype=np.float32)
+        elbow_pt, wrist_pt = _two_bone_ik(
+            out[shoulder], target, pole, UPPER_ARM_RATIO * world_span, FOREARM_RATIO * world_span
+        )
+        out[elbow] = elbow_pt
+        out[wrist] = wrist_pt
+        for joint in hand:  # 손 점들은 손목이 옮겨진 만큼 함께 옮긴다
+            out[joint, :2] += wrist_pt[:2] - old_wrist[:2]
+            out[joint, 2] = wrist_pt[2] + float(np.clip(view[joint, 2] - view[wrist, 2], -0.1, 0.1))
     return out
+
+
+def _two_bone_ik(
+    shoulder: np.ndarray, target: np.ndarray, pole: np.ndarray, upper: float, fore: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """어깨에서 길이 upper, fore인 두 뼈로 target에 닿는 (팔꿈치, 손목). 팔꿈치는 pole 쪽으로 굽힌다."""
+    s = shoulder.astype(np.float64)
+    to = target.astype(np.float64) - s
+    dist = float(np.linalg.norm(to))
+    if dist < 1e-6:
+        return pole.astype(np.float32), target.astype(np.float32)
+    u = to / dist
+    dist = float(np.clip(dist, abs(upper - fore) + 1e-4, upper + fore - 1e-4))  # 닿지 않으면 그 방향으로 최대한
+    along = (upper * upper - fore * fore + dist * dist) / (2.0 * dist)
+    height = float(np.sqrt(max(upper * upper - along * along, 0.0)))
+    bend = pole.astype(np.float64) - s
+    bend -= (bend @ u) * u
+    if float(np.linalg.norm(bend)) < 1e-6:
+        bend = np.array([0.0, -1.0, 0.0]) - u[1] * u  # 팔꿈치 방향을 모르면 아래쪽으로
+    bend /= max(float(np.linalg.norm(bend)), 1e-6)
+    elbow = s + u * along + bend * height
+    wrist = s + u * dist
+    return elbow.astype(np.float32), wrist.astype(np.float32)
 
 
 def world_to_avatar(world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1121,7 +1173,7 @@ def draw_hud(
     tracking = "추가기능 골격 표시 중" if skeleton_on else "라인 골격 표시 중"
     draw.text((32, 92), tracking, font=font_small, fill=(186, 214, 230, 255))
 
-    help_text = "Q 종료    M 반전    V 추가기능    B 디버그    S 저장"
+    help_text = "Q 종료    M 반전    V 추가기능    H 손가락    B 디버그    S 저장"
     box = draw.textbbox((0, 0), help_text, font=font_small)
     text_w = box[2] - box[0]
     bar_x = max(16, (width - text_w) // 2 - 18)
@@ -1156,7 +1208,30 @@ def self_test(model_name: str) -> int:
         landmarker.close()
     count = len(result.pose_landmarks or [])
     log.info("self-test ok  model=%s  poses=%d", model_path.name, count)
+
+    from hand_tracking import HAND_MODEL, HandTracker
+
+    hand_path = download_file(*HAND_MODEL, "손 모델")
+    tracker = HandTracker(hand_path)
+    try:
+        hands = tracker.detect(image, 0)
+    finally:
+        tracker.close()
+    log.info("self-test ok  model=%s  hands=%d", hand_path.name, len(hands))
     return 0
+
+
+def open_hand_tracker():
+    """손 인식기를 연다. 실패하면 경고만 남기고 None (손가락 연동 없이 계속 실행)."""
+    from hand_tracking import HAND_MODEL, HandTracker
+
+    try:
+        tracker = HandTracker(download_file(*HAND_MODEL, "손 모델"))
+    except (Exception, SystemExit) as exc:
+        log.warning("손 인식기를 열지 못해 손가락 연동 없이 실행합니다: %s", exc)
+        return None
+    log.info("손 인식기를 열었습니다. H 키로 손가락 연동을 켜고 끕니다.")
+    return tracker
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1168,10 +1243,16 @@ def run(args: argparse.Namespace) -> int:
     avatar = AvatarState()
     from avatar_mesh import load_bone_avatar
 
-    bone_avatar = load_bone_avatar(ROOT / "assets" / "skeleton.glb", ROOT / "assets" / "bone_map.json")
+    bone_avatar = load_bone_avatar(bone_map=ROOT / "assets" / "bone_map.json")
     collimator = load_collimator()
     font = load_font(22)
     font_small = load_font(16)
+    from hand_tracking import FingerState, draw_hands, match_hands
+
+    hands_on = not args.no_hands
+    hand_tracker = open_hand_tracker() if hands_on else None
+    hands_on = hand_tracker is not None
+    fingers = FingerState()
 
     mirror = not args.no_mirror
     show_collimator = True
@@ -1223,15 +1304,25 @@ def run(args: argparse.Namespace) -> int:
             points, vis, live, scale = avatar.current(now)
             place_x, place_y, zoom = avatar.placement(live)
 
+            hands, matched = [], {}
+            if hands_on and hand_tracker is not None:
+                hands = hand_tracker.detect(image, stamp)
+                matched = match_hands(hands, primary_pose(poses))
+            fingers.update(matched, now)
+
             view = frame
             if poses:
                 if show_skeleton:
                     view = render_poses(frame, poses, detailed_face, glow, xray)
                 else:
                     view = render_line_skeleton(frame, poses)
+            if hands:
+                draw_hands(view, hands, matched)
             if bone_avatar is not None:
                 avatar_view = bone_avatar.render(
-                    points, vis, avatar.yaw, avatar.pitch, live, STAGE, (place_x, place_y), zoom
+                    points, vis, avatar.yaw, avatar.pitch, live, STAGE, (place_x, place_y), zoom,
+                    curls=fingers.curls() if hands_on else None,
+                    hand_frames=fingers.hand_frames(now) if hands_on else None,
                 )
             else:
                 avatar_view = render_avatar(
@@ -1251,6 +1342,8 @@ def run(args: argparse.Namespace) -> int:
                     view = draw_seen_debug(view, raw, smooth, presence, seen, font_small)
                     if now - debug_logged >= 1.0:
                         log.debug(diag_log_line(raw, smooth, presence, seen))
+                        if hands_on:
+                            log.debug("손가락(도) 손 %d개 인식, 짝 %s | %s", len(hands), sorted(matched), fingers.summary())
                         debug_logged = now
             view = draw_hud(view, fps, len(poses), mirror, show_skeleton, font, font_small)
             avatar_view = draw_avatar_hud(avatar_view, live, font, font_small)
@@ -1280,6 +1373,11 @@ def run(args: argparse.Namespace) -> int:
                 glow = not glow
             elif key in (ord("f"), ord("F")):
                 detailed_face = not detailed_face
+            elif key in (ord("h"), ord("H")):
+                if hand_tracker is None:
+                    hand_tracker = open_hand_tracker()
+                hands_on = hand_tracker is not None and not hands_on
+                log.info("손가락 연동 %s", "켜짐" if hands_on else "꺼짐")
             elif key in (ord("b"), ord("B")):
                 debug_mode = not debug_mode
                 # 디버그 중에는 콘솔 출력 레벨을 DEBUG로 낮추고, 끄면 INFO로 되돌린다.
@@ -1320,6 +1418,8 @@ def run(args: argparse.Namespace) -> int:
     finally:
         camera.close()
         landmarker.close()
+        if hand_tracker is not None:
+            hand_tracker.close()
         cv2.destroyAllWindows()
     return 0
 
@@ -1334,6 +1434,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-mirror", action="store_true", help="좌우 반전 없이 카메라 원본을 봅니다")
     parser.add_argument("--self-test", action="store_true", help="모델 로드와 빈 프레임 추론만 확인합니다")
     parser.add_argument("--inspect-glb", action="store_true", help="뼈 메시의 본 이름과 크기를 출력합니다")
+    parser.add_argument("--no-hands", action="store_true", help="손가락 연동(손 인식) 없이 시작합니다. 실행 중 H 키로 켤 수 있습니다")
     args = parser.parse_args()
     args.poses = min(4, max(1, args.poses))
     return args
@@ -1351,9 +1452,9 @@ def main() -> int:
     setup_logging()
     args = parse_args()
     if args.inspect_glb:
-        from avatar_mesh import describe_glb
+        from avatar_mesh import DEFAULT_GLB, describe_glb
 
-        log.info("%s", describe_glb(ROOT / "assets" / "skeleton.glb"))
+        log.info("%s", describe_glb(DEFAULT_GLB))
         return 0
     if args.self_test:
         return self_test(args.model)

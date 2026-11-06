@@ -2,3 +2,8 @@ Human Skeleton rigged GLB
 https://grab3d.com/models/anatomy/human-skeleton/
 License: CC0 1.0
 https://grab3d.com/dl/human-skeleton-rigged/human-skeleton-rigged.glb
+
+skeleton_fingers.glb
+skeleton.glb에 손가락 본 30개(손마다 엄지~새끼 x 3마디)를 추가한 파생본. 원본 라이선스(CC0)를 따른다.
+생성: .venv\Scripts\python tools\add_finger_bones.py
+관절 위치: tools\finger_joints_left.json, tools\finger_joints_right.json (Blender 정면 직교 렌더에서 확인)
