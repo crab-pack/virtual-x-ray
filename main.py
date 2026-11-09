@@ -1085,6 +1085,117 @@ class Collimator:
         return out
 
 
+def enable_dpi_awareness() -> None:
+    """Windows 화면 배율(125% 등) 때문에 창이 확대되어 보이지 않게, 실제 픽셀 단위로 그린다.
+
+    창을 만들기 전에 불러야 한다.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # 모니터별 DPI 인식
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def monitor_size(window: str) -> tuple[int, int] | None:
+    """창이 있는 모니터의 해상도(px). Windows가 아니거나 알 수 없으면 None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    try:
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = (ctypes.c_void_p, wintypes.DWORD)
+        user32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        hwnd = user32.FindWindowW(None, window)
+        monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+        rect = info.rcMonitor
+        return rect.right - rect.left, rect.bottom - rect.top
+    except Exception:
+        return None
+
+
+class FullscreenView:
+    """아바타 창 전체화면 전환. 화면은 키우거나 비율을 바꾸지 않고 가운데에 두고, 남는 곳은 검은색으로 채운다.
+
+    화면이 모니터보다 크면(예: 세로 1100px 화면을 1080p 모니터에) 비율을 유지한 채 모니터에 맞게 줄인다.
+    """
+
+    def __init__(self, window: str, windowed_size: tuple[int, int]) -> None:
+        self.window = window
+        self.windowed_size = windowed_size
+        self.on = False
+        self.size: tuple[int, int] | None = None
+        self.offset = (0, 0)
+        self.scale = 1.0
+        self._canvas: np.ndarray | None = None
+
+    def toggle(self) -> None:
+        self.on = not self.on
+        if self.on:
+            size = monitor_size(self.window)  # 전체화면으로 바꾸기 전, 창이 있는 모니터 기준
+            cv2.setWindowProperty(self.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            if size is None:
+                cv2.waitKey(1)
+                _, _, w, h = cv2.getWindowImageRect(self.window)
+                size = (w, h) if w > 0 and h > 0 else None
+            self.size = size
+            self._canvas = None
+            log.info("전체화면 켜짐 (%s)", f"{size[0]}x{size[1]}" if size else "해상도 알 수 없음")
+        else:
+            cv2.setWindowProperty(self.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.window, *self.windowed_size)
+            self.offset, self.scale = (0, 0), 1.0
+            log.info("전체화면 꺼짐")
+
+    def compose(self, image: np.ndarray) -> np.ndarray:
+        if not self.on or self.size is None:
+            return image
+        screen_w, screen_h = self.size
+        height, width = image.shape[:2]
+        scale = min(1.0, screen_w / width, screen_h / height)
+        if scale < 1.0:
+            image = cv2.resize(
+                image, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_AREA
+            )
+        img_h, img_w = image.shape[:2]
+        x0, y0 = (screen_w - img_w) // 2, (screen_h - img_h) // 2
+        if self._canvas is None or self._canvas.shape[:2] != (screen_h, screen_w):
+            self._canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+        # 여백은 처음 만든 검은색 그대로 두고, 화면 자리만 매 프레임 덮어쓴다.
+        self._canvas[y0 : y0 + img_h, x0 : x0 + img_w] = image
+        self.offset, self.scale = (x0, y0), scale
+        return self._canvas
+
+    def to_image(self, x: int, y: int) -> tuple[int, int]:
+        """전체화면 마우스 좌표를 원래 아바타 화면 좌표로 바꾼다."""
+        if not self.on:
+            return x, y
+        return int((x - self.offset[0]) / self.scale), int((y - self.offset[1]) / self.scale)
+
+
 def draw_collimator_hint(frame: np.ndarray, font_small: ImageFont.ImageFont) -> np.ndarray:
     """편집 모드 안내 문구 (콜리메이터 덮개 위에 그려서 어둡게 가려지지 않게)."""
 
@@ -1187,9 +1298,22 @@ def draw_avatar_hud(
         status = "추적 중" if live else "대기"
         draw.text((32, 60), status, font=font_small, fill=(186, 214, 230, 255))
 
+<<<<<<< Updated upstream
         help_text = "방향키 위치    + - 확대    A D 회전    C 조명    L 조명 맞추기    R 초기화"
         help_font = fit_text(draw, help_text, font_small, width - 68)
         box = draw.textbbox((0, 0), help_text, font=help_font)
+=======
+    help_text = "방향키 위치    + - 확대    A D 회전    C 조명    L 조명 맞추기    F 전체화면    R 초기화"
+    box = draw.textbbox((0, 0), help_text, font=font_small)
+    text_w = box[2] - box[0]
+    bar_x = max(16, (width - text_w) // 2 - 18)
+    draw.rounded_rectangle((bar_x, height - 52, bar_x + text_w + 36, height - 16), radius=12, fill=(8, 12, 18, 170))
+    draw.text((bar_x + 18, height - 44), help_text, font=font_small, fill=(226, 236, 244, 255))
+
+    if not live:
+        message = "카메라에 몸이 보이면 따라 움직입니다"
+        box = draw.textbbox((0, 0), message, font=font_small)
+>>>>>>> Stashed changes
         text_w = box[2] - box[0]
         bar_x = max(16, (width - text_w) // 2 - 18)
         draw.rounded_rectangle((bar_x, height - 52, bar_x + text_w + 36, height - 16), radius=12, fill=(8, 12, 18, 170))
@@ -1479,12 +1603,19 @@ def run(args: argparse.Namespace) -> int:
         return {"frame": frame, "now": now, "result": result, "hands": hands}
     placed = False
 
+    enable_dpi_awareness()
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     cv2.namedWindow(AVATAR_WINDOW, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW, 800, 450)
     cv2.resizeWindow(AVATAR_WINDOW, 480, 700)
-    # 마우스 좌표는 창 크기와 상관없이 아바타 화면(이미지) 픽셀 좌표로 들어온다
-    cv2.setMouseCallback(AVATAR_WINDOW, collimator.on_mouse)
+    fullscreen = FullscreenView(AVATAR_WINDOW, (480, 700))
+
+    # 마우스 좌표는 창 크기와 상관없이 표시한 이미지의 픽셀 좌표로 들어온다.
+    # 전체화면이면 검은 여백이 붙은 이미지 기준이므로 원래 아바타 화면 좌표로 되돌린다.
+    def on_avatar_mouse(event: int, x: int, y: int, flags: int, param) -> None:
+        collimator.on_mouse(event, *fullscreen.to_image(x, y), flags, param)
+
+    cv2.setMouseCallback(AVATAR_WINDOW, on_avatar_mouse)
     log.info("카메라 창과 뼈 아바타 창을 열었습니다. Q 또는 Esc 로 종료합니다.")
 
     try:
@@ -1559,7 +1690,7 @@ def run(args: argparse.Namespace) -> int:
             if collimator.editing:
                 avatar_view = draw_collimator_hint(avatar_view, font_small)
             cv2.imshow(WINDOW, view)
-            cv2.imshow(AVATAR_WINDOW, avatar_view)
+            cv2.imshow(AVATAR_WINDOW, fullscreen.compose(avatar_view))
             if not placed:
                 cv2.moveWindow(WINDOW, 20, 40)
                 cv2.moveWindow(AVATAR_WINDOW, 840, 30)
@@ -1583,7 +1714,7 @@ def run(args: argparse.Namespace) -> int:
             elif key in (ord("g"), ord("G")):
                 glow = not glow
             elif key in (ord("f"), ord("F")):
-                detailed_face = not detailed_face
+                fullscreen.toggle()
             elif key in (ord("h"), ord("H")):
                 if hand_tracker is None:
                     hand_tracker = open_hand_tracker()
